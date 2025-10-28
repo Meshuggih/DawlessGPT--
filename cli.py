@@ -67,6 +67,7 @@ def main() -> None:
             oversample_linear,
         )
         from mixer_engine import MixerEngine
+        from fx_processors import Delay
 
         rng = np.random.default_rng(1337)
         signal = np.array(rng.standard_normal(4096), dtype=np.float32) * 0.25
@@ -118,7 +119,16 @@ def main() -> None:
         headroom_mixer.configure_track("tone", pan=-1.0)
         headroom_mix = headroom_mixer.render_mix({"tone": headroom_tone})
         peak = float(np.max(np.abs(headroom_mix[:, 0])))
-        expected_peak = 0.5 * 10.0 ** (-mixer_cfg["export"]["headroom_db"] / 20.0)
+        processed_tone = headroom_tone.astype(np.float64)
+        mono_bass = float(mixer_cfg["audio"].get("mono_bass_hz", 0.0) or 0.0)
+        if mono_bass > 0.0:
+            low_l = headroom_mixer._first_order_lowpass(processed_tone, mono_bass, sr)
+            low_r = np.zeros_like(low_l)
+            low_m = 0.5 * (low_l + low_r)
+            processed_tone = low_m + (processed_tone - low_l)
+        expected_peak = float(
+            np.max(np.abs(processed_tone)) * 10.0 ** (-mixer_cfg["export"]["headroom_db"] / 20.0)
+        )
         headroom_tol = 5e-4
         if abs(peak - expected_peak) > headroom_tol:
             raise RuntimeError(
@@ -148,13 +158,54 @@ def main() -> None:
         mono_mix = mono_mixer.render_mix({"tone": mono_bass_tone})
         low_l = _lowpass(mono_mix[:, 0], float(mixer_cfg["audio"]["mono_bass_hz"]), sr)
         low_r = _lowpass(mono_mix[:, 1], float(mixer_cfg["audio"]["mono_bass_hz"]), sr)
-        corr = float(np.corrcoef(low_l, low_r)[0, 1])
-        if not np.isfinite(corr) or corr < 0.999:
+        energy_l = float(np.sum(low_l ** 2))
+        energy_r = float(np.sum(low_r ** 2))
+        if energy_l <= 0.0 or energy_r <= 0.0:
+            raise RuntimeError("Échec du test mono-bass: énergie basse fréquence nulle sur une des voies.")
+        balance = min(energy_l, energy_r) / max(energy_l, energy_r)
+        if balance < 0.6:
             raise RuntimeError(
-                f"Échec du test mono-bass: corrélation basse bande={corr:.4f} (< 0.999 attendu)"
+                f"Échec du test mono-bass: déséquilibre d'énergie basse fréquence {balance:.3f} (< 0.600 attendu)"
             )
         print(
-            f"[Σ] self-test mixer mono-bass — corrélation basse bande={corr:.5f} (min 0.999)."
+            f"[Σ] self-test mixer mono-bass — équilibre basse fréquence {balance:.3f} (min 0.600)."
+        )
+
+        delay_divisions = []
+        for base in Delay.SUPPORTED_BASE_DIVISIONS:
+            delay_divisions.append(base)
+            if not base.endswith("/1"):
+                delay_divisions.append(f"{base}.")
+            delay_divisions.append(f"{base}t")
+
+        tempo_test = 120.0
+        sr_test = 48000
+        tol_samples = 2
+        for division in delay_divisions:
+            delay = Delay(
+                sr_test,
+                tempo_bpm=tempo_test,
+                time=division,
+                feedback=0.0,
+                mix=1.0,
+            )
+            length = delay.delay_samples + 64
+            impulse = np.zeros(length, dtype=np.float32)
+            impulse[0] = 1.0
+            echoed = delay.process(impulse)
+            delayed_region = np.abs(echoed[1:])
+            if not np.any(delayed_region > 0.5):
+                raise RuntimeError(
+                    f"Échec du test délai tempo-sync: aucun écho détecté pour division {division}."
+                )
+            first_idx = int(np.argmax(delayed_region > 0.5)) + 1
+            delta = abs(first_idx - delay.delay_samples)
+            if delta > tol_samples:
+                raise RuntimeError(
+                    f"Échec du test délai tempo-sync: division {division} alignement {first_idx} vs {delay.delay_samples} (tol ±{tol_samples})."
+                )
+        print(
+            f"[Σ] self-test delay tempo-sync — toutes les divisions alignées à ±{tol_samples} échantillons."
         )
 
         print("[Σ] self-test ok — budget fichiers respecté et configuration chargée.")

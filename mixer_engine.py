@@ -52,32 +52,36 @@ class MixerEngine:
         self.headroom_db = float(export_cfg.get("headroom_db", 1.0))
         self._limiter_ceiling_db = float(export_cfg.get("target_peak_dbtp", -0.3))
 
+        self.tempo_bpm: float = float(audio_cfg.get("tempo_default", 120.0))
+
         self.cfg_fx_delay_time = fx_defaults.get("delay_time", "1/8.")
         self.cfg_fx_delay_feedback = float(fx_defaults.get("delay_feedback", 0.4))
         self.cfg_fx_delay_mix = float(fx_defaults.get("delay_mix", 0.25))
 
-        room_size = float(fx_defaults.get("reverb_room_size", 0.8))
-        decay = float(fx_defaults.get("reverb_decay", 0.6))
-        reverb_mix = float(fx_defaults.get("reverb_mix", 0.22))
+        self.cfg_fx_reverb_mix = float(fx_defaults.get("reverb_mix", 0.22))
+        self.cfg_fx_reverb_decay = float(fx_defaults.get("reverb_decay", 0.6))
+        self.cfg_fx_reverb_room_size = float(fx_defaults.get("reverb_room_size", 0.8))
+        self.cfg_fx_reverb_pre_delay = fx_defaults.get("reverb_pre_delay", "1/64")
 
         self.reverb_bus = SchroederReverb(
             self.sample_rate,
-            room_size=room_size,
-            decay=decay,
-            mix=reverb_mix,
+            tempo_bpm=self.tempo_bpm,
+            room_size=self.cfg_fx_reverb_room_size,
+            decay=self.cfg_fx_reverb_decay,
+            mix=self.cfg_fx_reverb_mix,
+            pre_delay=self.cfg_fx_reverb_pre_delay,
         )
         self.delay_bus = Delay(
             self.sample_rate,
+            tempo_bpm=self.tempo_bpm,
             feedback=self.cfg_fx_delay_feedback,
             mix=self.cfg_fx_delay_mix,
             time=self.cfg_fx_delay_time,
-            tempo_bpm=float(audio_cfg.get("tempo_default", 120.0)),
         )
 
         self.track_order: List[str] = []
         self.tracks: Dict[str, TrackSettings] = {}
         self._sidechain_routes: List[SidechainRoute] = []
-        self.tempo_bpm: float = float(audio_cfg.get("tempo_default", 120.0))
 
     # ------------------------------------------------------------------ setup --
     def set_track_order(self, names: Sequence[str]) -> None:
@@ -105,6 +109,13 @@ class MixerEngine:
             mix=self.cfg_fx_delay_mix,
             tempo_bpm=bpm,
         )
+        self.configure_reverb(
+            mix=self.cfg_fx_reverb_mix,
+            decay=self.cfg_fx_reverb_decay,
+            room_size=self.cfg_fx_reverb_room_size,
+            pre_delay=self.cfg_fx_reverb_pre_delay,
+            tempo_bpm=bpm,
+        )
 
     def configure_delay(
         self,
@@ -126,6 +137,33 @@ class MixerEngine:
             mix=self.cfg_fx_delay_mix,
             time=self.cfg_fx_delay_time,
             tempo_bpm=self.tempo_bpm,
+        )
+
+    def configure_reverb(
+        self,
+        *,
+        mix: float,
+        decay: float,
+        room_size: float,
+        pre_delay: str,
+        tempo_bpm: Optional[float] = None,
+    ) -> None:
+        """(Re)initialise the Schroeder reverb bus with tempo-synced pre-delay."""
+
+        self.cfg_fx_reverb_mix = float(mix)
+        self.cfg_fx_reverb_decay = float(decay)
+        self.cfg_fx_reverb_room_size = float(room_size)
+        self.cfg_fx_reverb_pre_delay = str(pre_delay)
+        if tempo_bpm is not None:
+            self.tempo_bpm = float(tempo_bpm)
+
+        self.reverb_bus = SchroederReverb(
+            self.sample_rate,
+            tempo_bpm=self.tempo_bpm,
+            room_size=self.cfg_fx_reverb_room_size,
+            decay=self.cfg_fx_reverb_decay,
+            mix=self.cfg_fx_reverb_mix,
+            pre_delay=self.cfg_fx_reverb_pre_delay,
         )
 
     def clear_sidechains(self) -> None:
