@@ -66,6 +66,7 @@ def main() -> None:
             downsample_linear,
             oversample_linear,
         )
+        from mixer_engine import MixerEngine
 
         rng = np.random.default_rng(1337)
         signal = np.array(rng.standard_normal(4096), dtype=np.float32) * 0.25
@@ -94,6 +95,66 @@ def main() -> None:
             )
         print(
             f"[Σ] self-test DSP brickwall_limit — excès max={excess:.3e} (tol {ceiling_tolerance:.1e})."
+        )
+
+        mixer_cfg = {
+            "audio": {"sample_rate": 48000, "mono_bass_hz": 160, "tempo_default": 120},
+            "export": {"headroom_db": 6.0, "target_peak_dbtp": 0.0},
+            "fx_defaults": {
+                "delay_time": "1/8.",
+                "delay_feedback": 0.0,
+                "delay_mix": 0.0,
+                "reverb_mix": 0.0,
+                "reverb_decay": 0.6,
+                "reverb_room_size": 0.8,
+            },
+        }
+        sr = int(mixer_cfg["audio"]["sample_rate"])
+        t = np.arange(sr) / sr
+
+        headroom_tone = (0.5 * np.sin(2 * np.pi * 2000 * t)).astype(np.float32)
+        headroom_mixer = MixerEngine(mixer_cfg)
+        headroom_mixer.set_track_order(["tone"])
+        headroom_mixer.configure_track("tone", pan=-1.0)
+        headroom_mix = headroom_mixer.render_mix({"tone": headroom_tone})
+        peak = float(np.max(np.abs(headroom_mix[:, 0])))
+        expected_peak = 0.5 * 10.0 ** (-mixer_cfg["export"]["headroom_db"] / 20.0)
+        headroom_tol = 5e-4
+        if abs(peak - expected_peak) > headroom_tol:
+            raise RuntimeError(
+                f"Échec du test de headroom: pic={peak:.4f} attendu={expected_peak:.4f} (tol {headroom_tol:.1e})"
+            )
+        print(
+            f"[Σ] self-test mixer headroom — pic={peak:.4f} (attendu {expected_peak:.4f} ±{headroom_tol:.1e})."
+        )
+
+        def _lowpass(signal: np.ndarray, cutoff_hz: float, sample_rate: int) -> np.ndarray:
+            if cutoff_hz <= 0.0:
+                return np.zeros_like(signal)
+            rc = 1.0 / (2.0 * np.pi * cutoff_hz)
+            dt = 1.0 / float(sample_rate)
+            alpha = dt / (rc + dt)
+            out = np.zeros_like(signal)
+            acc = 0.0
+            for i, value in enumerate(signal):
+                acc += alpha * (value - acc)
+                out[i] = acc
+            return out
+
+        mono_bass_tone = (0.5 * np.sin(2 * np.pi * 60 * t)).astype(np.float32)
+        mono_mixer = MixerEngine(mixer_cfg)
+        mono_mixer.set_track_order(["tone"])
+        mono_mixer.configure_track("tone", pan=1.0)
+        mono_mix = mono_mixer.render_mix({"tone": mono_bass_tone})
+        low_l = _lowpass(mono_mix[:, 0], float(mixer_cfg["audio"]["mono_bass_hz"]), sr)
+        low_r = _lowpass(mono_mix[:, 1], float(mixer_cfg["audio"]["mono_bass_hz"]), sr)
+        corr = float(np.corrcoef(low_l, low_r)[0, 1])
+        if not np.isfinite(corr) or corr < 0.999:
+            raise RuntimeError(
+                f"Échec du test mono-bass: corrélation basse bande={corr:.4f} (< 0.999 attendu)"
+            )
+        print(
+            f"[Σ] self-test mixer mono-bass — corrélation basse bande={corr:.5f} (min 0.999)."
         )
 
         print("[Σ] self-test ok — budget fichiers respecté et configuration chargée.")
