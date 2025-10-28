@@ -4,9 +4,7 @@ import json
 import os
 from pathlib import Path
 from typing import Sequence
-import yaml
-
-from render import run_session
+from render import run_session, load_config_safe
 
 MAX_PRODUCT_FILES = 20
 PRODUCT_EXTENSIONS: Sequence[str] = (
@@ -53,10 +51,9 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg_path = Path(args.config)
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config_safe(str(cfg_path))
 
-    base_dir = cfg_path.resolve().parent
+    base_dir = Path(cfg.get("_base_dir", cfg_path.resolve().parent))
 
     if args.selftest:
         check_file_budget(cfg, base_dir=base_dir)

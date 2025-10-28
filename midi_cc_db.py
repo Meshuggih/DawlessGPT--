@@ -1,24 +1,36 @@
 # /mnt/data/midi_cc_db.py
-import json, os
-from typing import Dict, Optional, Tuple
+import json
+import os
+from typing import Any, Dict, Optional, Tuple
 
 class CCResolver:
-    def __init__(self, studio_config_path: str, cc_overrides_path: Optional[str]=None,
-                 fallback_profile: Optional[Dict[str,int]]=None):
+    def __init__(self, studio_config_path: Optional[str], cc_overrides_path: Optional[str]=None,
+                 fallback_profile: Optional[Dict[str,int]]=None,
+                 studio_config: Optional[Dict[str, Any]] = None,
+                 cc_overrides: Optional[Dict[str, Any]] = None):
         self.db: Dict[str, Dict[str,int]] = {}
         self.fallback: Dict[str,int] = fallback_profile or {}
-        if studio_config_path and os.path.exists(studio_config_path):
+        cfg_data: Dict[str, Any] = {}
+        if studio_config is not None:
+            cfg_data = dict(studio_config)
+        elif studio_config_path and os.path.exists(studio_config_path):
             with open(studio_config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            hw = cfg.get("midi_cc_hardware", {})
-            for dev, mapping in hw.items():
-                self.db[dev.lower()] = {k.lower(): int(v) for k,v in mapping.items()}
-        if cc_overrides_path and os.path.exists(cc_overrides_path):
+                cfg_data = json.load(f)
+
+        hw = cfg_data.get("midi_cc_hardware", {}) if isinstance(cfg_data, dict) else {}
+        for dev, mapping in hw.items():
+            self.db[dev.lower()] = {k.lower(): int(v) for k, v in mapping.items()}
+
+        overrides_data: Dict[str, Any] = {}
+        if cc_overrides is not None:
+            overrides_data = dict(cc_overrides)
+        elif cc_overrides_path and os.path.exists(cc_overrides_path):
             with open(cc_overrides_path, "r", encoding="utf-8") as f:
-                ov = json.load(f)
-            for dev, mapping in ov.items():
-                d = self.db.setdefault(dev.lower(), {})
-                d.update({k.lower(): int(v) for k,v in mapping.items()})
+                overrides_data = json.load(f)
+
+        for dev, mapping in overrides_data.items():
+            d = self.db.setdefault(dev.lower(), {})
+            d.update({k.lower(): int(v) for k, v in mapping.items()})
 
     def resolve(self, param: str, device: Optional[str]=None) -> Tuple[int,str]:
         p = (param or "").lower()
