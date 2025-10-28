@@ -13,8 +13,8 @@ import numpy as np
 import logging
 
 from mixer_engine import MixerEngine
-from arrangement_engine import ArrangementEngine, DropBusSource
-from modulation_matrix import ModulationMatrix
+from arrangement_engine import ArrangementEngine
+from modulation_matrix import ModulationMatrix, DropBusSource
 from midi_writer import MIDIFile
 from midi_cc_db import CCResolver
 from sequencer import Sequencer, Pattern, Step
@@ -266,9 +266,47 @@ def _apply_style_to_mixer(cfg: Dict[str, Any], style: str, mixer: MixerEngine, b
             shape=r.get("shape", "exp"),
         )
 
-def _wire_modmatrix_drop(cfg: Dict[str, Any], arranger: ArrangementEngine) -> ModulationMatrix:
-    mm = ModulationMatrix(sum_mode=cfg["modulation_matrix"]["sum_mode"])
-    return mm
+def _wire_modmatrix_drop(
+    cfg: Dict[str, Any],
+    arranger: ArrangementEngine,
+) -> Tuple[ModulationMatrix, List[Dict[str, Any]]]:
+    matrix_cfg = cfg.get("modulation_matrix", {})
+    mm = ModulationMatrix(sum_mode=matrix_cfg.get("sum_mode", "weighted_clamp"))
+    drop_bus = matrix_cfg.get("drop_bus_name", "DROP")
+    drop_routes: List[Dict[str, Any]] = [
+        {
+            "protocol": "filter_sweep_master",
+            "destination": "pad.reverb_send",
+            "amount": 1.0,
+            "range": (0.0, 0.85),
+            "curve": "exp",
+        },
+        {
+            "protocol": "reverb_wash_bass_filter",
+            "destination": "bass.reverb_send",
+            "amount": 1.0,
+            "range": (0.0, 0.7),
+            "curve": "lin",
+        },
+    ]
+    for route in drop_routes:
+        src = DropBusSource(
+            route["protocol"],
+            bus=drop_bus,
+            protocols_path=arranger.protocols_path,
+            protocols=arranger.protocols,
+        )
+        rng = route.get("range", (0.0, 1.0))
+        if not isinstance(rng, (list, tuple)) or len(rng) != 2:
+            rng = (0.0, 1.0)
+        mm.add(
+            src,
+            route["destination"],
+            amt=float(route.get("amount", 1.0)),
+            rng=(float(rng[0]), float(rng[1])),
+            curve=str(route.get("curve", "lin")),
+        )
+    return mm, drop_routes
 
 def _render_tracks(plan: SessionPlan, cfg: Dict[str, Any]) -> Dict[str, np.ndarray]:
     sr = int(cfg["audio"]["sample_rate"])
@@ -496,8 +534,11 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
     plan = SessionPlan(style=style, bpm=bpm, seed=seed, duration_s=dur, sections=sections)
 
     drop_protocols = cfg.get("_assets", {}).get("drop_protocols", {})
-    arranger = ArrangementEngine(protocols_path=cfg["paths"]["assets"]["drop_protocols"], protocols=drop_protocols)
-    modmat = _wire_modmatrix_drop(cfg, arranger)
+    arranger = ArrangementEngine(
+        protocols_path=cfg["paths"]["assets"]["drop_protocols"],
+        protocols=drop_protocols,
+    )
+    modmat, drop_routes = _wire_modmatrix_drop(cfg, arranger)
 
     # Rendu (placeholder)
     tracks = _render_tracks(plan, cfg)
@@ -515,6 +556,12 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
         mx.configure_track(name, **settings)
 
     _apply_style_to_mixer(cfg, plan.style, mx, plan.bpm)
+
+    drop_destinations = arranger.prepare_destination_context(mx, drop_routes)
+    if drop_destinations:
+        arranger.apply_modulations(modmat, drop_destinations)
+        arranger.apply_final_values_to_mixer(mx, drop_destinations)
+    drop_summary = arranger.summarise_modulations(drop_destinations) if drop_destinations else []
 
     # appliquer fx_overrides aux bus
     fxov = cfg["styles"][plan.style].get("fx_overrides", {})
@@ -587,7 +634,7 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
         "cc_used": cc_used,
         "cc_origin_stats": cc_origin_stats,
         "device_map": cfg.get("midi_cc",{}).get("device_map",{}),
-        "drops": ["filter_sweep_master","reverb_wash_bass_filter"],
+        "drops": drop_summary,
         "paths": outs,
         "schema_version": cfg["logging"]["report_schema_version"]
     }
