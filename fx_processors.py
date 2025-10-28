@@ -9,7 +9,7 @@ from dsp_core import brickwall_limit, downsample_linear, oversample_linear
 class Delay:
     """Tempo-synchronised feedback delay with a circular buffer."""
 
-    SUPPORTED_BASE_DIVISIONS = ("1/1", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64")
+    SUPPORTED_BASE_DIVISIONS = ("1/1", "1/2", "1/4", "1/8", "3/16", "1/16", "1/32", "1/64")
 
     def __init__(
         self,

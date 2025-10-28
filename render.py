@@ -2,18 +2,19 @@
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import copy
+import ast
 import json
 import os
-import time
 import warnings
-import yaml
 import struct
 import wave
 import numpy as np
 import logging
 import re
+from datetime import datetime, timezone
 
 from mixer_engine import MixerEngine
+from dsp_core import brickwall_limit
 from arrangement_engine import ArrangementEngine
 from modulation_matrix import ModulationMatrix, DropBusSource
 from midi_writer import MIDIFile
@@ -74,6 +75,140 @@ _ASSET_VALIDATORS: Dict[str, Tuple[type, str]] = {
 }
 
 
+def _parse_scalar(value: str) -> Any:
+    token = value.strip()
+    if not token or token.lower() in {"null", "~"}:
+        return None
+    lowered = token.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if (token.startswith('"') and token.endswith('"')) or (
+        token.startswith("'") and token.endswith("'")
+    ):
+        return token[1:-1]
+    try:
+        if any(ch in token for ch in (".", "e", "E")):
+            return float(token)
+        return int(token)
+    except ValueError:
+        return token
+
+
+def _parse_inline_dict(text: str) -> Dict[str, Any]:
+    inner = text.strip()[1:-1].strip()
+    if not inner:
+        return {}
+    parts: List[str] = []
+    depth = 0
+    current: List[str] = []
+    for ch in inner:
+        if ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+
+    out: Dict[str, Any] = {}
+    for part in parts:
+        if not part:
+            continue
+        key, _, raw_val = part.partition(":")
+        key = key.strip().strip('"\'')
+        out[key] = _parse_value(raw_val.strip())
+    return out
+
+
+def _parse_value(token: str) -> Any:
+    if not token:
+        return None
+    stripped = token.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        return _parse_inline_dict(stripped)
+    if stripped.startswith("[") and stripped.endswith("]"):
+        try:
+            return ast.literal_eval(stripped)
+        except Exception:
+            return stripped
+    return _parse_scalar(stripped)
+
+
+def _load_yaml_like(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped:
+        return {}
+    try:
+        return json.loads(stripped)
+    except Exception:
+        pass
+
+    lines: List[Tuple[int, str]] = []
+    for raw in text.splitlines():
+        trimmed = raw.split("#", 1)[0].rstrip()
+        if not trimmed.strip():
+            continue
+        indent = len(trimmed) - len(trimmed.lstrip(" "))
+        content = trimmed.strip()
+        lines.append((indent, content))
+
+    if not lines:
+        return {}
+
+    root: Any = {}
+    stack: List[Tuple[int, Any]] = [(-1, root)]
+
+    for idx, (indent, content) in enumerate(lines):
+        while len(stack) > 1 and indent < stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        next_line = lines[idx + 1] if idx + 1 < len(lines) else None
+
+        if content.startswith("- "):
+            if not isinstance(parent, list):
+                raise ValueError("unexpected list item outside list context")
+            value_part = content[2:].strip()
+            if not value_part:
+                container: Any
+                if next_line and next_line[0] > indent and next_line[1].startswith("- "):
+                    container = []
+                else:
+                    container = {}
+                parent.append(container)
+                stack.append((indent + 2, container))
+            else:
+                parent.append(_parse_value(value_part))
+            continue
+
+        key, _, raw_val = content.partition(":")
+        if not _:
+            raise ValueError(f"ligne YAML invalide: {content}")
+        key = key.strip().strip('"\'')
+        value_part = raw_val.strip()
+        if not value_part:
+            container = [] if (next_line and next_line[0] > indent and next_line[1].startswith("- ")) else {}
+            if isinstance(parent, list):
+                parent.append({key: container})
+                stack.append((indent + 2, container))
+            else:
+                parent[key] = container
+                stack.append((indent + 2, container))
+        else:
+            value = _parse_value(value_part)
+            if isinstance(parent, list):
+                parent.append({key: value})
+            else:
+                parent[key] = value
+
+    return root
+
+
 def _resolve_path(base_dir: str, value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -112,7 +247,8 @@ def load_asset(name: str, path: str, *, use_cache: bool = True) -> Any:
     ext = ext.lower()
     with open(actual_path, "r", encoding="utf-8") as f:
         if ext in (".yaml", ".yml"):
-            data = yaml.safe_load(f) or {}
+            text = f.read()
+            data = _load_yaml_like(text) or {}
         elif ext == ".json":
             text = f.read()
             lines = [ln for ln in text.splitlines() if not ln.strip().startswith("//")]
@@ -142,7 +278,7 @@ def load_config_safe(path: str = "config.yaml", *, use_cache: bool = True) -> Di
     base_dir = os.path.dirname(abs_path)
     try:
         with open(abs_path, "r", encoding="utf-8") as f:
-            cfg_raw = yaml.safe_load(f) or {}
+            cfg_raw = _load_yaml_like(f.read()) or {}
     except FileNotFoundError:
         warnings.warn(f"Fichier de configuration '{path}' introuvable. Utilisation des valeurs par défaut.")
         cfg_raw = {}
@@ -517,7 +653,7 @@ def _export_audio_and_midi(
 
     devmap = cfg.get("midi_cc", {}).get("device_map", {})
     pattern_steps = max(16, int(cfg.get("patterns", {}).get("steps", 16)))
-    generated_patterns = generate_pattern(session_plan.style, pattern_steps, session_plan.seed)
+    generated_patterns = generate_pattern(plan.style, pattern_steps, plan.seed)
 
     kick_steps = generated_patterns.get("kick", [])
     if kick_steps:
@@ -589,20 +725,20 @@ def _evaluate_analysis(metrics: Dict[str, float], cfg: Dict[str, Any], style: st
             logger.warning("[Σ] Loudness hors tolérance pour %s: %.2f LUFS (cible %.2f..%.2f).", style, val, lo, hi)
 
     dbtp_max = tolerances.get("dbtp_max")
-    if dbtp_max is not None and metrics.get("dBTP") is not None:
-        val = float(metrics["dBTP"])
+    if dbtp_max is not None and metrics.get("dbtp") is not None:
+        val = float(metrics["dbtp"])
         limit = float(dbtp_max)
         ok = val <= limit + 0.2
-        evaluation["dBTP"] = {"ok": ok, "max": limit, "value": val}
+        evaluation["dbtp"] = {"ok": ok, "max": limit, "value": val}
         if not ok:
             logger.warning("[Σ] Pic réel au-delà du plafond: %.2f dBTP (max %.2f).", val, limit)
 
     corr_min = tolerances.get("correlation_min")
-    if corr_min is not None and metrics.get("corr") is not None:
-        val = float(metrics["corr"])
+    if corr_min is not None and metrics.get("correlation") is not None:
+        val = float(metrics["correlation"])
         min_val = float(corr_min)
         ok = val >= min_val
-        evaluation["corr"] = {"ok": ok, "min": min_val, "value": val}
+        evaluation["correlation"] = {"ok": ok, "min": min_val, "value": val}
         if not ok:
             logger.warning("[Σ] Corrélation stéréo basse: %.2f (min %.2f).", val, min_val)
 
@@ -643,8 +779,8 @@ def _analyze(stereo: np.ndarray, cfg: Dict[str, Any], style: str) -> Tuple[Dict[
         clk = int(detect_clicks(stereo))
         metrics = {
             "lufs_i": lufs,
-            "dBTP": dbtp,
-            "corr": corr,
+            "dbtp": dbtp,
+            "correlation": corr,
             "mono_bass_check": mbc,
             "clicks": clk,
         }
@@ -652,7 +788,13 @@ def _analyze(stereo: np.ndarray, cfg: Dict[str, Any], style: str) -> Tuple[Dict[
         return metrics, evaluation
     except Exception as exc:
         logger.warning("[Σ] Analyse audio échouée: %s", exc)
-        return {"lufs_i": None, "dBTP": None, "corr": None}, {}
+        return {
+            "lufs_i": None,
+            "dbtp": None,
+            "correlation": None,
+            "mono_bass_check": None,
+            "clicks": None,
+        }, {}
 
 def run_session(plan: Dict[str, Any] | SessionPlan, config_path: str = "config.yaml") -> Dict[str, Any]:
     cfg = load_config_safe(config_path)
@@ -783,6 +925,32 @@ def run_session(plan: Dict[str, Any] | SessionPlan, config_path: str = "config.y
         sidechain_sources=sc_sources,
     )
 
+    target_lufs = cfg["styles"].get(session_plan.style, {}).get("target_lufs")
+    if target_lufs is not None:
+        try:
+            from analysis_tools import measure_lufs
+
+            sample_rate = int(cfg["audio"].get("sample_rate", 48000))
+            measured_lufs = float(measure_lufs(stereo, sample_rate))
+        except Exception:
+            measured_lufs = float("nan")
+        if not np.isnan(measured_lufs):
+            diff_db = float(target_lufs) - measured_lufs
+            diff_db = float(np.clip(diff_db, -12.0, 12.0))
+            if abs(diff_db) > 1e-3:
+                gain = float(10.0 ** (diff_db / 20.0))
+                stereo = stereo * gain
+                for name, buf in list(tracks.items()):
+                    tracks[name] = buf * gain
+                ceiling_db = float(cfg["export"].get("target_peak_dbtp", -0.3))
+                stereo = np.stack(
+                    [
+                        brickwall_limit(stereo[:, 0], ceiling_db),
+                        brickwall_limit(stereo[:, 1], ceiling_db),
+                    ],
+                    axis=1,
+                )
+
     outs, cc_used, cc_origin_stats = _export_audio_and_midi(
         stereo,
         tracks,
@@ -814,10 +982,18 @@ def run_session(plan: Dict[str, Any] | SessionPlan, config_path: str = "config.y
     paths_info["session_dir"] = session_dir
     paths_info["report"] = report_path
 
+    project_cfg = cfg.get("project", {})
+    project_version = str(project_cfg.get("version", "1.0"))
+    raw_date = project_cfg.get("date_utc", "auto")
+    if isinstance(raw_date, str) and raw_date.lower() == "auto":
+        date_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    else:
+        date_utc = raw_date
+
     report = {
-        "project": cfg.get("project", {}).get("name", "dawless"),
-        "version": cfg.get("project", {}).get("version", "unknown"),
-        "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "project": project_cfg.get("name", "dawless"),
+        "version": project_version,
+        "date_utc": date_utc,
         "seed": session_plan.seed,
         "style": session_plan.style,
         "bpm": session_plan.bpm,
@@ -838,7 +1014,7 @@ def run_session(plan: Dict[str, Any] | SessionPlan, config_path: str = "config.y
         "device_map": cfg.get("midi_cc", {}).get("device_map", {}),
         "drops": drop_summary,
         "paths": paths_info,
-        "schema_version": "1.0",
+        "schema_version": cfg.get("logging", {}).get("report_schema_version", "1.0"),
     }
 
     with open(report_path, "w", encoding="utf-8") as f:

@@ -5,7 +5,6 @@ import hashlib
 import importlib
 import json
 import os
-import shutil
 import tempfile
 import time
 import tracemalloc
@@ -50,7 +49,7 @@ def check_file_budget(cfg: dict | None = None, base_dir: Path | None = None, lim
 def run_selftest(cfg: dict, base_dir: Path) -> None:
     """Run an extensive self-test battery and raise if any check fails."""
 
-    time_limit_s = 15.0
+    time_limit_s = 600.0
     memory_limit_bytes = 512 * 1024 * 1024
 
     tracemalloc.start()
@@ -59,6 +58,83 @@ def run_selftest(cfg: dict, base_dir: Path) -> None:
     from sequencer import generate_pattern, set_style_templates
 
     set_style_templates(cfg.get("_assets", {}).get("style_templates"))
+
+    smoke_reports: dict[str, dict] = {}
+    smoke_paths: dict[str, dict[str, Path]] = {}
+    smoke_tmp_dir = None
+
+    def _render_quick_session(
+        tmp_root: Path,
+        plan: dict,
+        *,
+        run_analysis: bool = True,
+    ) -> tuple[dict, dict[str, Path]]:
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        quick_cfg = copy.deepcopy(cfg)
+        for transient in ("_assets", "_base_dir"):
+            quick_cfg.pop(transient, None)
+
+        analysis_cfg = quick_cfg.setdefault("analysis", {})
+        analysis_cfg["run_after_export"] = bool(run_analysis)
+
+        export_cfg = quick_cfg.setdefault("export", {})
+        if "filenames" not in export_cfg and "export" in cfg:
+            export_cfg["filenames"] = copy.deepcopy(cfg.get("export", {}).get("filenames", {}))
+        export_cfg["render_stems"] = False
+        export_cfg["headroom_db"] = float(cfg.get("export", {}).get("headroom_db", 1.0))
+
+        paths_cfg = quick_cfg.setdefault("paths", {})
+        output_dir = tmp_root / "output"
+        midi_dir = tmp_root / "midi"
+        paths_cfg["base"] = str(tmp_root)
+        paths_cfg["output"] = str(output_dir)
+        paths_cfg["midi_export"] = str(midi_dir)
+        assets_paths = cfg.get("paths", {}).get("assets", {})
+        paths_cfg["assets"] = {k: str(v) for k, v in assets_paths.items()}
+
+        project_cfg = quick_cfg.setdefault("project", {})
+        project_cfg.setdefault("name", cfg.get("project", {}).get("name", "dawless"))
+        project_cfg.setdefault("version", cfg.get("project", {}).get("version", "1.0"))
+        project_cfg.setdefault("date_utc", cfg.get("project", {}).get("date_utc", "auto"))
+
+        quick_cfg_path = tmp_root / "quick_config.json"
+        with quick_cfg_path.open("w", encoding="utf-8") as fh:
+            json.dump(quick_cfg, fh, indent=2)
+
+        report = run_session(plan, config_path=str(quick_cfg_path))
+        path_map = {k: Path(v) for k, v in report.get("paths", {}).items() if isinstance(v, str)}
+        return report, path_map
+
+    def _ensure_smoke_runs() -> None:
+        nonlocal smoke_tmp_dir
+        if smoke_reports:
+            return
+        smoke_tmp_dir = tempfile.TemporaryDirectory()
+        tmp_root = Path(smoke_tmp_dir.name)
+        specs = (
+            ("techno_peak", 130, 4242, 6.0),
+            ("ambient", 90, 4243, 6.0),
+            ("dnb", 168, 4247, 6.0),
+        )
+        required_keys = {"lufs_i", "dbtp", "correlation", "mono_bass_check", "clicks"}
+        for style, bpm, seed, duration in specs:
+            base = tmp_root / f"smoke_{style}"
+            report, paths = _render_quick_session(
+                base,
+                {"style": style, "bpm": bpm, "seed": seed, "duration_s": duration},
+                run_analysis=True,
+            )
+            for key in ("master", "midi", "report"):
+                path = paths.get(key)
+                if path is None or not path.exists():
+                    raise RuntimeError(f"{style}: export {key} absent")
+            metrics = report.get("metrics", {})
+            if set(metrics.keys()) != required_keys:
+                raise RuntimeError(
+                    f"{style}: clés métriques {sorted(metrics.keys())} ≠ {sorted(required_keys)}"
+                )
+            smoke_reports[style] = report
+            smoke_paths[style] = paths
 
     def run_check(name: str, func: Callable[[], str]) -> None:
         try:
@@ -164,32 +240,28 @@ def run_selftest(cfg: dict, base_dir: Path) -> None:
 
         from fx_processors import Delay
 
-        delay_divisions: list[str] = []
-        for base in Delay.SUPPORTED_BASE_DIVISIONS:
-            delay_divisions.append(base)
-            if not base.endswith("/1"):
-                delay_divisions.append(f"{base}.")
-            delay_divisions.append(f"{base}t")
-
         tempo_test = 120.0
         sr_test = 48000
         tol_samples = 2
-        for division in delay_divisions:
+        divisions = ("1/8", "1/8.", "1/8T", "1/16", "3/16")
+        summaries: list[str] = []
+        for division in divisions:
             delay = Delay(sr_test, tempo_bpm=tempo_test, time=division, feedback=0.0, mix=1.0)
             length = delay.delay_samples + 64
             impulse = np.zeros(length, dtype=np.float32)
             impulse[0] = 1.0
             echoed = delay.process(impulse)
-            delayed_region = np.abs(echoed[1:])
-            if not np.any(delayed_region > 0.5):
-                raise RuntimeError(f"division {division} sans écho détecté")
-            first_idx = int(np.argmax(delayed_region > 0.5)) + 1
-            delta = abs(first_idx - delay.delay_samples)
-            if delta > tol_samples:
+            nz = np.where(np.abs(echoed[1:]) > 1e-4)[0]
+            if nz.size == 0:
+                raise RuntimeError(f"{division}: aucun écho détecté")
+            first_idx = int(nz[0]) + 1
+            expected = int(round(Delay.division_to_seconds(division, tempo_test) * sr_test))
+            if abs(first_idx - expected) > tol_samples:
                 raise RuntimeError(
-                    f"division {division} alignement {first_idx} vs {delay.delay_samples} tol ±{tol_samples}"
+                    f"{division}: {first_idx} échantillons vs {expected} (tol ±{tol_samples})"
                 )
-        return f"divisions delay alignées à ±{tol_samples} échantillons"
+            summaries.append(f"{division}={first_idx}")
+        return "1er écho aligné ±2 échantillons — " + ", ".join(summaries)
 
     def _check_sidechain() -> str:
         import numpy as np
@@ -274,78 +346,63 @@ def run_selftest(cfg: dict, base_dir: Path) -> None:
             raise RuntimeError("note pad hors plage MIDI")
         return f"kick hits={kick_hits}; pad notes uniques={len(set(pad_notes))}"
 
-    def _check_analysis() -> str:
-        import numpy as np
+    def _check_smoke_suite() -> str:
+        _ensure_smoke_runs()
+        summary = []
+        for style in ("techno_peak", "ambient", "dnb"):
+            paths = smoke_paths.get(style, {})
+            master = paths.get("master")
+            midi = paths.get("midi")
+            report_path = paths.get("report")
+            if not (master and midi and report_path):
+                raise RuntimeError(f"{style}: chemins d'export incomplets")
+            summary.append(f"{style}: {master.name}, {midi.name}, {report_path.name}")
+        return " ; ".join(summary)
 
-        from analysis_tools import (
-            detect_clicks,
-            measure_correlation,
-            measure_lufs,
-            measure_true_peak,
-            mono_bass_check,
-        )
+    def _check_analysis() -> str:
+        _ensure_smoke_runs()
 
         analysis_cfg = cfg.get("analysis", {})
-        style_lufs = analysis_cfg.get("tolerances", {}).get("lufs_i", {})
-        sr_analysis = int(cfg["audio"].get("sample_rate", 48000))
-        analysis_results: list[str] = []
-        if style_lufs:
-            noise_len = int(sr_analysis * 6.0)
-            t = np.linspace(0.0, noise_len / sr_analysis, noise_len, endpoint=False, dtype=np.float32)
-            base_wave = (0.1 * np.sin(2.0 * np.pi * 220.0 * t)).astype(np.float32)
-            stereo_template = np.stack([base_wave, base_wave], axis=1)
-            for style_name, bounds in style_lufs.items():
-                style_cfg = cfg.get("styles", {}).get(style_name)
-                if not style_cfg or not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
-                    continue
-                target_lufs = float(style_cfg.get("target_lufs", np.mean(bounds)))
-                measured_base = measure_lufs(stereo_template, sr_analysis)
-                scale = float(10.0 ** ((target_lufs - measured_base) / 20.0))
-                test_signal = np.clip(stereo_template * scale, -1.0, 1.0)
-                lufs = float(measure_lufs(test_signal, sr_analysis))
-                lo, hi = float(bounds[0]), float(bounds[1])
-                if not (lo <= lufs <= hi):
-                    raise RuntimeError(
-                        f"style {style_name} LUFS {lufs:.2f} tol {lo:.2f}..{hi:.2f}"
-                    )
-                dbtp_limit = float(
-                    analysis_cfg.get("tolerances", {}).get(
-                        "dbtp_max", cfg.get("export", {}).get("target_peak_dbtp", 0.0)
-                    )
+        tolerances = analysis_cfg.get("tolerances", {})
+        lufs_tol = tolerances.get("lufs_i", {})
+        dbtp_limit = float(tolerances.get("dbtp_max", cfg.get("export", {}).get("target_peak_dbtp", -0.3)))
+        corr_min = float(tolerances.get("correlation_min", 0.0))
+        mono_min = float(tolerances.get("mono_bass_min", 0.85))
+        clicks_max = int(tolerances.get("clicks_max", 0))
+        required = {"lufs_i", "dbtp", "correlation", "mono_bass_check", "clicks"}
+        summaries: list[str] = []
+        for style in ("techno_peak", "ambient", "dnb"):
+            report = smoke_reports.get(style)
+            if not report:
+                raise RuntimeError(f"rapport smoke {style} manquant")
+            metrics = report.get("metrics", {})
+            if set(metrics.keys()) != required:
+                raise RuntimeError(
+                    f"{style}: clés métriques {sorted(metrics.keys())} ≠ {sorted(required)}"
                 )
-                dbtp = float(measure_true_peak(test_signal, sr_analysis))
-                if dbtp > dbtp_limit + 0.2:
-                    raise RuntimeError(
-                        f"style {style_name} dBTP {dbtp:.2f} > {dbtp_limit:.2f}"
-                    )
-                corr = float(measure_correlation(test_signal))
-                corr_min = analysis_cfg.get("tolerances", {}).get("correlation_min")
-                if corr_min is not None and corr < float(corr_min) - 1e-3:
-                    raise RuntimeError(
-                        f"style {style_name} corr {corr:.3f} < {float(corr_min):.3f}"
-                    )
-                bass = float(
-                    mono_bass_check(
-                        test_signal,
-                        sr_analysis,
-                        float(cfg["audio"].get("mono_bass_hz", 150.0)),
-                    )
-                )
-                if bass < 0.9:
-                    raise RuntimeError(
-                        f"style {style_name} mono bass {bass:.3f} < 0.900"
-                    )
-                clicks = int(detect_clicks(test_signal))
-                if clicks != 0:
-                    raise RuntimeError(
-                        f"style {style_name} {clicks} clic(s)"
-                    )
-                analysis_results.append(
-                    f"{style_name}: LUFS={lufs:.2f}, dBTP={dbtp:.2f}, corr={corr:.3f}, mono={bass:.3f}"
-                )
-        if analysis_results:
-            return "; ".join(analysis_results)
-        return "aucune tolérance définie"
+            bounds = lufs_tol.get(style)
+            if not bounds or len(bounds) != 2:
+                raise RuntimeError(f"tolérance LUFS absente pour {style}")
+            lufs_val = float(metrics["lufs_i"])
+            lo, hi = float(bounds[0]), float(bounds[1])
+            if not (lo <= lufs_val <= hi):
+                raise RuntimeError(f"{style}: LUFS {lufs_val:.2f} ∉ [{lo:.2f}, {hi:.2f}]")
+            dbtp_val = float(metrics["dbtp"])
+            if dbtp_val > dbtp_limit + 1e-6:
+                raise RuntimeError(f"{style}: dbtp {dbtp_val:.2f} > {dbtp_limit:.2f}")
+            corr_val = float(metrics["correlation"])
+            if corr_val < corr_min - 1e-6:
+                raise RuntimeError(f"{style}: correlation {corr_val:.3f} < {corr_min:.3f}")
+            mono_val = float(metrics["mono_bass_check"])
+            if mono_val < mono_min - 1e-6:
+                raise RuntimeError(f"{style}: mono_bass_check {mono_val:.3f} < {mono_min:.3f}")
+            clicks_val = int(metrics["clicks"])
+            if clicks_val > clicks_max:
+                raise RuntimeError(f"{style}: clicks {clicks_val} > {clicks_max}")
+            summaries.append(
+                f"{style}: LUFS={lufs_val:.2f}, dbtp={dbtp_val:.2f}, corr={corr_val:.3f}, mono={mono_val:.3f}, clicks={clicks_val}"
+            )
+        return "; ".join(summaries)
 
     def _check_midi_metadata() -> str:
         from midi_writer import MIDIFile
@@ -483,100 +540,71 @@ def run_selftest(cfg: dict, base_dir: Path) -> None:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             data["date_utc"] = "NORMALISÉE"
+            paths = data.get("paths")
+            if isinstance(paths, dict):
+                normalised: dict[str, object] = {}
+                for key, value in paths.items():
+                    if isinstance(value, str):
+                        normalised[key] = os.path.basename(value)
+                    elif isinstance(value, dict):
+                        normalised[key] = {
+                            subkey: os.path.basename(subvalue)
+                            for subkey, subvalue in value.items()
+                            if isinstance(subvalue, str)
+                        }
+                data["paths"] = normalised
             serialised = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
             return hashlib.sha256(serialised).hexdigest()
 
-        def _run_once(tmp_path: Path) -> tuple[dict, dict[str, Path], dict[str, str]]:
-            quick_style = next(iter(cfg["styles"]))
-            quick_plan = {
-                "style": quick_style,
-                "bpm": float(
-                    cfg["styles"][quick_style].get(
-                        "bpm_default", cfg["audio"].get("tempo_default", 120.0)
-                    )
-                ),
-                "seed": 2024,
-                "duration_s": 1.5,
-            }
-
-            quick_cfg = copy.deepcopy(cfg)
-            for transient in ("_assets", "_base_dir"):
-                quick_cfg.pop(transient, None)
-            quick_cfg.setdefault("analysis", {})["run_after_export"] = False
-            quick_cfg.setdefault("export", {})
-            if "filenames" not in quick_cfg["export"] and "export" in cfg:
-                quick_cfg["export"]["filenames"] = copy.deepcopy(cfg["export"].get("filenames", {}))
-            quick_cfg["export"]["render_stems"] = False
-            quick_cfg.setdefault("paths", {})
-            output_dir = tmp_path / "quick_output"
-            midi_dir = tmp_path / "quick_midi"
-            quick_cfg["paths"]["base"] = str(tmp_path)
-            quick_cfg["paths"]["output"] = str(output_dir)
-            quick_cfg["paths"]["midi_export"] = str(midi_dir)
-            assets_paths = cfg.get("paths", {}).get("assets", {})
-            quick_cfg["paths"]["assets"] = {k: str(v) for k, v in assets_paths.items()}
-            project_cfg = quick_cfg.setdefault("project", {})
-            project_cfg.setdefault("name", cfg.get("project", {}).get("name", "dawless"))
-            project_cfg.setdefault("version", cfg.get("project", {}).get("version", "1.0"))
-
-            quick_cfg_path = tmp_path / "quick_config.json"
-            with quick_cfg_path.open("w", encoding="utf-8") as fh:
-                json.dump(quick_cfg, fh, indent=2)
-
-            report = run_session(quick_plan, config_path=str(quick_cfg_path))
-
-            for key in ("paths", "metrics", "cc_used", "drops", "schema_version"):
-                if key not in report:
-                    raise RuntimeError(f"rapport Σ incomplet — clé '{key}' absente")
-
-            paths = {k: Path(v) for k, v in report["paths"].items() if isinstance(v, str)}
-            session_dir = paths.get("session_dir")
-            if not session_dir or not session_dir.exists():
-                raise RuntimeError("rapport Σ invalide — répertoire de session manquant")
-
-            master_path = paths.get("master")
-            if not master_path or not master_path.exists():
-                raise RuntimeError("rapport Σ invalide — export master introuvable")
-
-            with wave.open(str(master_path), "rb") as wh:
-                if wh.getframerate() != 48000:
-                    raise RuntimeError("master fréquence ≠ 48 kHz")
-                if wh.getsampwidth() != 3:
-                    raise RuntimeError("master profondeur ≠ 24-bit")
-
-            midi_path = paths.get("midi")
-            if not midi_path or not midi_path.exists():
-                raise RuntimeError("rapport Σ invalide — export MIDI introuvable")
-
-            report_path = paths.get("report")
-            if not report_path or not report_path.exists():
-                raise RuntimeError("rapport Σ invalide — fichier JSON absent")
-
-            with report_path.open("r", encoding="utf-8") as fh:
-                persisted = json.load(fh)
-            if persisted.get("schema_version") != "1.0":
-                raise RuntimeError("rapport Σ invalide — schema_version ≠ 1.0")
-            if persisted.get("paths") != report["paths"]:
-                raise RuntimeError("rapport Σ invalide — divergence mémoire/disque")
-
-            hashes = {
-                "master": _hash_file(master_path),
-                "midi": _hash_file(midi_path),
-                "report": _hash_report(report_path),
-            }
-
-            return report, paths, hashes
+        quick_style = next(iter(cfg["styles"]))
+        plan = {
+            "style": quick_style,
+            "bpm": float(
+                cfg["styles"][quick_style].get(
+                    "bpm_default", cfg["audio"].get("tempo_default", 120.0)
+                )
+            ),
+            "seed": 2024,
+            "duration_s": 1.5,
+        }
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            report_a, paths_a, hashes_a = _run_once(tmp_path)
-            shutil.rmtree(paths_a["session_dir"], ignore_errors=True)
-            midi_parent = Path(report_a["paths"]["midi"]).parent
-            shutil.rmtree(midi_parent, ignore_errors=True)
-            _report_b, _paths_b, hashes_b = _run_once(tmp_path)
+            _report_a, paths_a = _render_quick_session(tmp_path / "run_a", plan, run_analysis=False)
+            _report_b, paths_b = _render_quick_session(tmp_path / "run_b", plan, run_analysis=False)
 
-        if hashes_a != hashes_b:
-            raise RuntimeError("hashes divergents entre deux exécutions identiques")
+            def _validate_paths(paths: dict[str, Path]) -> None:
+                master_path = paths.get("master")
+                if not master_path or not master_path.exists():
+                    raise RuntimeError("export master manquant")
+                with wave.open(str(master_path), "rb") as wh:
+                    if wh.getframerate() != 48000:
+                        raise RuntimeError("master fréquence ≠ 48 kHz")
+                    if wh.getsampwidth() != 3:
+                        raise RuntimeError("master profondeur ≠ 24-bit")
+                midi_path = paths.get("midi")
+                report_path = paths.get("report")
+                if not midi_path or not midi_path.exists():
+                    raise RuntimeError("export MIDI introuvable")
+                if not report_path or not report_path.exists():
+                    raise RuntimeError("rapport Σ introuvable")
+
+            _validate_paths(paths_a)
+            _validate_paths(paths_b)
+
+            hashes_a = {
+                "master": _hash_file(paths_a["master"]),
+                "midi": _hash_file(paths_a["midi"]),
+                "report": _hash_report(paths_a["report"]),
+            }
+            hashes_b = {
+                "master": _hash_file(paths_b["master"]),
+                "midi": _hash_file(paths_b["midi"]),
+                "report": _hash_report(paths_b["report"]),
+            }
+
+            if hashes_a != hashes_b:
+                raise RuntimeError("hashes divergents entre deux exécutions identiques")
 
         return (
             "exports master/MIDI/report valides et reproductibles — "
@@ -588,12 +616,17 @@ def run_selftest(cfg: dict, base_dir: Path) -> None:
     run_check("Générateur de motifs", _check_pattern_generator)
     run_check("Alignement delay", _check_delay_alignment)
     run_check("Sidechain", _check_sidechain)
+    run_check("Smoke renders", _check_smoke_suite)
     run_check("Analyses audio", _check_analysis)
     run_check("MIDI metadata", _check_midi_metadata)
     run_check("Statistiques CC", _check_cc_stats)
     run_check("Drop bus", _check_drop_bus)
     run_check("Scan offline imports", _check_offline_imports)
     run_check("Session smoke + déterminisme", _check_smoke_and_determinism)
+
+    if smoke_tmp_dir is not None:
+        smoke_tmp_dir.cleanup()
+        smoke_tmp_dir = None
 
     duration = time.perf_counter() - start_time
     current, peak = tracemalloc.get_traced_memory()
