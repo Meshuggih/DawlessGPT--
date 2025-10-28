@@ -106,10 +106,11 @@ class TruePeakLimiter:
 
     def process(self, signal: np.ndarray) -> np.ndarray:
         if signal.ndim == 1:
-            up = oversample_linear(signal, self.os)
+            sig = signal.astype(np.float32, copy=False)
+            up = oversample_linear(sig, self.os)
             lim = brickwall_limit(up, self.ceiling_db)
             return downsample_linear(lim, self.os)
         else:
-            left  = self.process(signal[:,0])
-            right = self.process(signal[:,1])
+            left = self.process(signal[:, 0])
+            right = self.process(signal[:, 1])
             return np.stack([left, right], axis=1)

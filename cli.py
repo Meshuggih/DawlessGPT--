@@ -57,6 +57,45 @@ def main() -> None:
 
     if args.selftest:
         check_file_budget(cfg, base_dir=base_dir)
+
+        import numpy as np
+
+        from dsp_core import (
+            brickwall_limit,
+            db_to_lin,
+            downsample_linear,
+            oversample_linear,
+        )
+
+        rng = np.random.default_rng(1337)
+        signal = np.array(rng.standard_normal(4096), dtype=np.float32) * 0.25
+        factor = 4
+        oversampled = oversample_linear(signal, factor)
+        recovered = downsample_linear(oversampled, factor)
+        rms_err = float(np.sqrt(np.mean((signal - recovered) ** 2)))
+        rms_tolerance = 5e-7
+        if rms_err > rms_tolerance:
+            raise RuntimeError(
+                f"Échec du test oversample/downsample: rms={rms_err:.3e} tol={rms_tolerance:.1e}"
+            )
+        print(
+            f"[Σ] self-test DSP oversample/downsample — rms={rms_err:.3e} (tol {rms_tolerance:.1e})."
+        )
+
+        ceiling_db = -1.0
+        ceiling = np.float32(db_to_lin(ceiling_db))
+        limiter_input = np.array([-2.0, -0.1, 0.0, 0.1, 2.0], dtype=np.float32)
+        limited = brickwall_limit(limiter_input, ceiling_db)
+        excess = float(max(0.0, np.max(np.abs(limited)) - ceiling))
+        ceiling_tolerance = 1e-7
+        if excess > ceiling_tolerance:
+            raise RuntimeError(
+                f"Échec du test brickwall_limit: dépassement de {excess:.3e} (tol {ceiling_tolerance:.1e})"
+            )
+        print(
+            f"[Σ] self-test DSP brickwall_limit — excès max={excess:.3e} (tol {ceiling_tolerance:.1e})."
+        )
+
         print("[Σ] self-test ok — budget fichiers respecté et configuration chargée.")
         return
 
