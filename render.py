@@ -10,6 +10,7 @@ import yaml
 import struct
 import wave
 import numpy as np
+import logging
 
 from mixer_engine import MixerEngine
 from arrangement_engine import ArrangementEngine, DropBusSource
@@ -20,6 +21,8 @@ from sequencer import Sequencer, Pattern, Step
 
 CONFIG_CACHE: Dict[str, Dict[str, Any]] = {}
 ASSET_CACHE: Dict[str, Any] = {}
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_AUDIO = {
     "sample_rate": 44100,
@@ -377,7 +380,7 @@ def _export_audio_and_midi(stereo: np.ndarray, trackbufs: Dict[str, np.ndarray],
     ]
     seq.set_pattern("keys", pat_keys)
 
-    _cc_used = []
+    _cc_used: List[Dict[str, Any]] = []
     seq.to_midi(midifile, resolver, bpm=plan.bpm, collect_cc=_cc_used)
 
     midi_name = _fmt_name(cfg["export"]["filenames"]["midi"], project=cfg["project"]["name"],
@@ -385,7 +388,13 @@ def _export_audio_and_midi(stereo: np.ndarray, trackbufs: Dict[str, np.ndarray],
     midi_path = os.path.join(cfg["paths"]["midi_export"], midi_name)
     midifile.save(midi_path)
 
-    return {"master": master_path, "stems": stems, "midi": midi_path}, _cc_used
+    cc_origin_stats: Dict[str, int] = {}
+    for entry in _cc_used:
+        origin = entry.get("origin", "HYPOTHÈSE")
+        count = int(entry.get("count", 1))
+        cc_origin_stats[origin] = cc_origin_stats.get(origin, 0) + count
+
+    return {"master": master_path, "stems": stems, "midi": midi_path}, _cc_used, cc_origin_stats
 
 def _analyze(stereo: np.ndarray, cfg: Dict[str, Any]) -> Dict[str, float]:
     try:
@@ -401,6 +410,11 @@ def _analyze(stereo: np.ndarray, cfg: Dict[str, Any]) -> Dict[str, float]:
 
 def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") -> Dict[str, Any]:
     cfg = load_config_safe(config_path)
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        level_name = str(cfg.get("logging", {}).get("level", "INFO")).upper()
+        level = getattr(logging, level_name, logging.INFO)
+        logging.basicConfig(level=level)
     _ensure_dirs(cfg["paths"]["output"], cfg["paths"]["midi_export"])
     seed = int(session_plan.get("seed", cfg["project"]["seed"]))
     _init_rng(seed)
@@ -470,12 +484,17 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
                            sidechain_kick=tracks.get("kick", None),
                            sidechain_sources=sc_sources)
 
-    outs, cc_used = _export_audio_and_midi(stereo, tracks, cfg, plan, cfg["paths"]["output"])
+    outs, cc_used, cc_origin_stats = _export_audio_and_midi(stereo, tracks, cfg, plan, cfg["paths"]["output"])
     metrics = _analyze(stereo, cfg) if cfg["analysis"]["run_after_export"] else {}
 
-    cc_origin_stats = {"real": 0, "HYPOTHÈSE": 0}
-    for ev in cc_used:
-        cc_origin_stats[ev.get("origin","HYPOTHÈSE")] = cc_origin_stats.get(ev.get("origin","HYPOTHÈSE"), 0) + 1
+    cc_origin_stats.setdefault("real", 0)
+    cc_origin_stats.setdefault("HYPOTHÈSE", 0)
+    hyp_count = cc_origin_stats.get("HYPOTHÈSE", 0)
+    if hyp_count:
+        logger.warning(
+            "[Σ] CC mappings fallback used %d time(s); consider updating hardware profiles.",
+            hyp_count,
+        )
 
     report = {
         "project": cfg["project"]["name"],

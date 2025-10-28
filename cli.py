@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Sequence
 from render import run_session, load_config_safe
@@ -254,6 +255,72 @@ def main() -> None:
         print(
             "[Σ] self-test sidechain — réduction moyenne conforme pour shapes lin/exp/log (±10%)."
         )
+
+        from midi_writer import MIDIFile
+        from midi_cc_db import CCResolver
+        from sequencer import Sequencer, Pattern, Step
+
+        def _assert_meta_presence(numerator: int, denominator: int) -> None:
+            midi = MIDIFile()
+            midi.set_tempo(123.0)
+            midi.set_time_signature(numerator, denominator)
+            ti = midi.add_track("test", channel=0)
+            midi.add_note(ti, time_beats=0.0, note=60, velocity=100, duration_beats=1.0)
+            with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as tmp:
+                path = tmp.name
+            try:
+                midi.save(path)
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            finally:
+                os.remove(path)
+            if b"\xFF\x51\x03" not in data:
+                raise RuntimeError("Échec self-test MIDI: meta tempo absente du fichier.")
+            import math
+
+            denom_power = int(round(math.log(denominator, 2))) if denominator > 0 else 2
+            ts_bytes = bytes((0xFF, 0x58, 0x04, numerator & 0xFF, denom_power & 0xFF))
+            if ts_bytes not in data:
+                raise RuntimeError(
+                    f"Échec self-test MIDI: signature {numerator}/{denominator} introuvable."
+                )
+
+        _assert_meta_presence(4, 4)
+        _assert_meta_presence(3, 4)
+        print("[Σ] self-test MIDI metadata — tempo et signatures 4/4 & 3/4 détectées.")
+
+        resolver = CCResolver(
+            studio_config_path=None,
+            fallback_profile={"resonance": 71},
+            studio_config={"midi_cc_hardware": {"synth_test": {"cutoff": 74}}},
+        )
+        seq = Sequencer(ticks_per_beat=240)
+        pat = Pattern(channel=0, device="synth_test")
+        pat.steps = [
+            Step(beat=0.0, note=60, vel=100, length_beats=1.0, locks={"cutoff": 0.5}),
+            Step(beat=1.0, note=62, vel=100, length_beats=1.0, locks={"resonance": 0.4}),
+        ]
+        seq.set_pattern("test", pat)
+        midi = MIDIFile(ticks_per_beat=240)
+        cc_summary = []
+        seq.to_midi(midi, resolver, bpm=120.0, collect_cc=cc_summary)
+        total_cc_events = sum(len(tr.cc_events) for tr in midi.tracks)
+        counted_events = sum(int(entry.get("count", 1)) for entry in cc_summary)
+        if total_cc_events != counted_events:
+            raise RuntimeError(
+                "Échec self-test CC: incohérence entre événements MIDI et statistiques collectées."
+            )
+        origin_stats = {}
+        for entry in cc_summary:
+            origin = entry.get("origin", "HYPOTHÈSE")
+            origin_stats[origin] = origin_stats.get(origin, 0) + int(entry.get("count", 1))
+        if origin_stats.get("real", 0) < 1 or origin_stats.get("HYPOTHÈSE", 0) < 1:
+            raise RuntimeError(
+                "Échec self-test CC: les origines 'real' et 'HYPOTHÈSE' doivent toutes deux être présentes."
+            )
+        if not any("test" in entry.get("tracks", {}) for entry in cc_summary):
+            raise RuntimeError("Échec self-test CC: informations de piste manquantes dans le résumé CC.")
+        print("[Σ] self-test CC stats — origines et comptages cohérents.")
 
         print("[Σ] self-test ok — budget fichiers respecté et configuration chargée.")
         return
