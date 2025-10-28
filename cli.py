@@ -273,8 +273,9 @@ def main() -> None:
         analysis_results: list[str] = []
         if style_lufs:
             noise_len = int(sr_analysis * 6.0)
-            base_noise = rng.standard_normal(noise_len).astype(np.float32) * 0.1
-            stereo_template = np.stack([base_noise, base_noise], axis=1)
+            t = np.linspace(0.0, noise_len / sr_analysis, noise_len, endpoint=False, dtype=np.float32)
+            base_wave = (0.1 * np.sin(2.0 * np.pi * 220.0 * t)).astype(np.float32)
+            stereo_template = np.stack([base_wave, base_wave], axis=1)
             for style_name, bounds in style_lufs.items():
                 style_cfg = cfg.get("styles", {}).get(style_name)
                 if not style_cfg or not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
@@ -429,6 +430,78 @@ def main() -> None:
         print(
             f"[Σ] self-test drop bus — Δ moyen absolu {avg_abs_delta:.3f} sur pad.reverb_send."
         )
+
+        # Session smoke test — vérifie exports et rapport Σ
+        import copy
+        import wave
+
+        quick_style = next(iter(cfg["styles"]))
+        quick_plan = {
+            "style": quick_style,
+            "bpm": float(cfg["styles"][quick_style].get("bpm_default", cfg["audio"].get("tempo_default", 120.0))),
+            "seed": 2024,
+            "duration_s": 1.5,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            quick_cfg = copy.deepcopy(cfg)
+            for transient in ("_assets", "_base_dir"):
+                quick_cfg.pop(transient, None)
+            quick_cfg.setdefault("analysis", {})["run_after_export"] = False
+            quick_cfg.setdefault("export", {}).setdefault("filenames", cfg["export"]["filenames"])
+            quick_cfg["export"]["render_stems"] = False
+            quick_cfg.setdefault("paths", {})
+            quick_cfg["paths"]["base"] = "."
+            quick_cfg["paths"]["output"] = "./quick_output"
+            quick_cfg["paths"]["midi_export"] = "./quick_midi"
+            assets_paths = cfg["paths"].get("assets", {})
+            quick_cfg["paths"]["assets"] = {k: str(v) for k, v in assets_paths.items()}
+            project_cfg = quick_cfg.setdefault("project", {})
+            project_cfg.setdefault("name", cfg.get("project", {}).get("name", "dawless"))
+            project_cfg.setdefault("version", cfg.get("project", {}).get("version", "1.0"))
+
+            quick_cfg_path = tmp_path / "quick_config.json"
+            with quick_cfg_path.open("w", encoding="utf-8") as fh:
+                json.dump(quick_cfg, fh, indent=2)
+
+            report = run_session(quick_plan, config_path=str(quick_cfg_path))
+
+            for key in ("paths", "metrics", "cc_used", "drops", "schema_version"):
+                if key not in report:
+                    raise RuntimeError(f"Rapport Σ incomplet: clé '{key}' manquante.")
+
+            paths = report["paths"]
+            session_dir = Path(paths["session_dir"])
+            if not session_dir.exists():
+                raise RuntimeError("Rapport Σ invalide: répertoire de session absent.")
+
+            master_path = Path(paths["master"])
+            if not master_path.exists():
+                raise RuntimeError("Rapport Σ invalide: export master introuvable.")
+
+            with wave.open(str(master_path), "rb") as wh:
+                if wh.getframerate() != 48000:
+                    raise RuntimeError("Export master incorrect: fréquence d'échantillonnage ≠ 48 kHz.")
+                if wh.getsampwidth() != 3:
+                    raise RuntimeError("Export master incorrect: résolution ≠ 24-bit.")
+
+            midi_path = Path(paths["midi"])
+            if not midi_path.exists():
+                raise RuntimeError("Rapport Σ invalide: export MIDI introuvable.")
+
+            report_path = Path(paths["report"])
+            if not report_path.exists():
+                raise RuntimeError("Rapport Σ invalide: fichier JSON absent.")
+
+            with report_path.open("r", encoding="utf-8") as fh:
+                persisted = json.load(fh)
+            if persisted.get("schema_version") != "1.0":
+                raise RuntimeError("Rapport Σ invalide: schema_version différent de 1.0.")
+            if persisted.get("paths") != report["paths"]:
+                raise RuntimeError("Rapport Σ invalide: divergence entre rapport en mémoire et sur disque.")
+
+            print("[Σ] self-test session exports — master 24-bit/48 kHz, MIDI et rapport validés.")
 
         print("[Σ] self-test ok — budget fichiers respecté et configuration chargée.")
         return
