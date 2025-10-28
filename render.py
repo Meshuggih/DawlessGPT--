@@ -11,6 +11,7 @@ import struct
 import wave
 import numpy as np
 import logging
+import re
 
 from mixer_engine import MixerEngine
 from arrangement_engine import ArrangementEngine
@@ -239,6 +240,39 @@ def _ensure_dirs(*paths):
     for p in paths:
         os.makedirs(p, exist_ok=True)
 
+
+def _sanitize_component(*parts: Any) -> str:
+    raw = "_".join(str(p) for p in parts if p is not None)
+    raw = raw.strip()
+    if not raw:
+        return "session"
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
+    cleaned = cleaned.strip("-_")
+    return cleaned or "session"
+
+
+def _resample(data: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    if sr_in == sr_out:
+        return data
+    if data.ndim == 1:
+        data_2d = data[:, None]
+    else:
+        data_2d = data
+    n_samples = data_2d.shape[0]
+    if n_samples == 0:
+        return data
+    ratio = float(sr_out) / float(sr_in)
+    new_len = max(1, int(round(n_samples * ratio)))
+    xp = np.linspace(0.0, float(n_samples - 1), num=n_samples, dtype=np.float64)
+    x_new = np.linspace(0.0, float(n_samples - 1), num=new_len, dtype=np.float64)
+    resampled = np.stack([
+        np.interp(x_new, xp, data_2d[:, ch]).astype(np.float32)
+        for ch in range(data_2d.shape[1])
+    ], axis=1)
+    if data.ndim == 1:
+        return resampled[:, 0]
+    return resampled
+
 def _apply_style_to_mixer(cfg: Dict[str, Any], style: str, mixer: MixerEngine, bpm: float):
     fxd = cfg.get("fx_defaults", {})
     mixer.configure_delay(
@@ -344,33 +378,51 @@ def _write_wav_24(path: str, data: np.ndarray, sr: int, normalize: bool=False, t
         w.setframerate(sr)
         w.writeframes(_float_to_int24_pcm(data, dither=dither))
 
-def _export_audio_and_midi(stereo: np.ndarray, trackbufs: Dict[str, np.ndarray],
-                           cfg: Dict[str, Any], plan: SessionPlan, outdir: str):
-    sr = int(cfg["audio"]["sample_rate"])
-    master_name = _fmt_name(cfg["export"]["filenames"]["master"],
-                            project=cfg["project"]["name"], style=plan.style, bpm=int(plan.bpm), seed=plan.seed)
-    master_path = os.path.join(outdir, master_name)
-    _write_wav_24(master_path, stereo.astype(np.float32), sr,
-                  normalize=cfg["export"].get("normalize", True),
-                  target_peak_db=float(cfg["export"].get("target_peak_dbtp",-0.3)),
-                  dither=cfg["export"].get("dither", True))
+def _export_audio_and_midi(
+    stereo: np.ndarray,
+    trackbufs: Dict[str, np.ndarray],
+    cfg: Dict[str, Any],
+    plan: SessionPlan,
+    session_dir: str,
+    midi_dir: str,
+    filename_ctx: Dict[str, Any],
+    *,
+    target_sample_rate: int = 48000,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, int]]:
+    sr_cfg = int(cfg["audio"]["sample_rate"])
+    stereo_to_write = _resample(stereo, sr_cfg, target_sample_rate)
+    master_name = _fmt_name(cfg["export"]["filenames"]["master"], **filename_ctx)
+    master_path = os.path.join(session_dir, master_name)
+    _write_wav_24(
+        master_path,
+        stereo_to_write.astype(np.float32),
+        target_sample_rate,
+        normalize=cfg["export"].get("normalize", True),
+        target_peak_db=float(cfg["export"].get("target_peak_dbtp", -0.3)),
+        dither=cfg["export"].get("dither", True),
+    )
 
-    stems = {}
-    if cfg["export"]["render_stems"]:
+    stems: Dict[str, str] = {}
+    if cfg["export"].get("render_stems", False):
         for name, buf in trackbufs.items():
-            nm = _fmt_name(cfg["export"]["filenames"]["stem"],
-                           project=cfg["project"]["name"], style=plan.style, bpm=int(plan.bpm), seed=plan.seed, track=name)
-            p = os.path.join(outdir, nm)
-            _write_wav_24(p, np.stack([buf, buf], axis=1).astype(np.float32), sr,
-                          normalize=cfg["export"].get("normalize", True),
-                          target_peak_db=float(cfg["export"].get("target_peak_dbtp",-0.3)),
-                          dither=cfg["export"].get("dither", True))
+            stem_ctx = dict(filename_ctx)
+            stem_ctx["track"] = _sanitize_component(name)
+            nm = _fmt_name(cfg["export"]["filenames"]["stem"], **stem_ctx)
+            p = os.path.join(session_dir, nm)
+            stem_buf = _resample(buf, sr_cfg, target_sample_rate)
+            _write_wav_24(
+                p,
+                np.stack([stem_buf, stem_buf], axis=1).astype(np.float32),
+                target_sample_rate,
+                normalize=cfg["export"].get("normalize", True),
+                target_peak_db=float(cfg["export"].get("target_peak_dbtp", -0.3)),
+                dither=cfg["export"].get("dither", True),
+            )
             stems[name] = p
 
-    # === MIDI (p-locks + CC) ===
     midifile = MIDIFile()
     midifile.set_tempo(plan.bpm)
-    ts = (cfg["audio"].get("time_signature","4/4") or "4/4").split("/")
+    ts = (cfg["audio"].get("time_signature", "4/4") or "4/4").split("/")
     midifile.set_time_signature(int(ts[0]), int(ts[1]))
 
     assets = cfg.get("_assets", {})
@@ -385,45 +437,44 @@ def _export_audio_and_midi(stereo: np.ndarray, trackbufs: Dict[str, np.ndarray],
     hp_name = cfg["styles"][plan.style].get("humanize_profile", None)
     if hp_name:
         hp = cfg["humanize"]["profiles"].get(hp_name, {})
-        seq.humanize = dict(time_ms=hp.get("time_ms",0.0), vel_var=hp.get("vel_variation",0))
+        seq.humanize = dict(time_ms=hp.get("time_ms", 0.0), vel_var=hp.get("vel_variation", 0))
 
-    devmap = (cfg.get("midi_cc", {}).get("device_map", {}))
-    pat_bass  = Pattern(channel=0, device=devmap.get("bass","moog_minitaur"))
+    devmap = cfg.get("midi_cc", {}).get("device_map", {})
+    pat_bass = Pattern(channel=0, device=devmap.get("bass", "moog_minitaur"))
     pat_bass.steps += [
-        Step(beat=0.0,  note=36, vel=110, length_beats=2.0),
-        Step(beat=4.0,  locks={"cutoff":0.62, "resonance":0.55}),
-        Step(beat=8.0,  locks={"reverb_send":0.18}),
-        Step(beat=12.0, note=38, vel=108, length_beats=1.5, slide=True)
+        Step(beat=0.0, note=36, vel=110, length_beats=2.0),
+        Step(beat=4.0, locks={"cutoff": 0.62, "resonance": 0.55}),
+        Step(beat=8.0, locks={"reverb_send": 0.18}),
+        Step(beat=12.0, note=38, vel=108, length_beats=1.5, slide=True),
     ]
     seq.set_pattern("bass", pat_bass)
-    pat_stabs = Pattern(channel=1, device=devmap.get("stabs","subsequent_37"))
+    pat_stabs = Pattern(channel=1, device=devmap.get("stabs", "subsequent_37"))
     pat_stabs.steps += [
         Step(beat=0.0, note=55, vel=96, length_beats=1.0),
-        Step(beat=8.0, locks={"cutoff":0.58}),
-        Step(beat=24.0, locks={"delay_send":0.50})
+        Step(beat=8.0, locks={"cutoff": 0.58}),
+        Step(beat=24.0, locks={"delay_send": 0.50}),
     ]
     seq.set_pattern("stabs", pat_stabs)
-    pat_pad   = Pattern(channel=2, device=devmap.get("pad","roland_juno106"))
+    pat_pad = Pattern(channel=2, device=devmap.get("pad", "roland_juno106"))
     pat_pad.steps += [
         Step(beat=0.0, note=48, vel=80, length_beats=4.0),
-        Step(beat=16.0, locks={"cutoff":0.42}),
-        Step(beat=48.0, locks={"reverb_send":0.65})
+        Step(beat=16.0, locks={"cutoff": 0.42}),
+        Step(beat=48.0, locks={"reverb_send": 0.65}),
     ]
     seq.set_pattern("pad", pat_pad)
-    pat_keys  = Pattern(channel=3, device=devmap.get("keys","generic_synth"))
+    pat_keys = Pattern(channel=3, device=devmap.get("keys", "generic_synth"))
     pat_keys.steps += [
-        Step(beat=4.0,  note=60, vel=92, length_beats=0.5),
-        Step(beat=12.0, locks={"delay_send":0.60}),
-        Step(beat=28.0, locks={"chorus_send":0.55})
+        Step(beat=4.0, note=60, vel=92, length_beats=0.5),
+        Step(beat=12.0, locks={"delay_send": 0.60}),
+        Step(beat=28.0, locks={"chorus_send": 0.55}),
     ]
     seq.set_pattern("keys", pat_keys)
 
     _cc_used: List[Dict[str, Any]] = []
     seq.to_midi(midifile, resolver, bpm=plan.bpm, collect_cc=_cc_used)
 
-    midi_name = _fmt_name(cfg["export"]["filenames"]["midi"], project=cfg["project"]["name"],
-                          style=plan.style, bpm=int(plan.bpm), seed=plan.seed)
-    midi_path = os.path.join(cfg["paths"]["midi_export"], midi_name)
+    midi_name = _fmt_name(cfg["export"]["filenames"]["midi"], **filename_ctx)
+    midi_path = os.path.join(midi_dir, midi_name)
     midifile.save(midi_path)
 
     cc_origin_stats: Dict[str, int] = {}
@@ -514,24 +565,66 @@ def _analyze(stereo: np.ndarray, cfg: Dict[str, Any], style: str) -> Tuple[Dict[
         logger.warning("[Σ] Analyse audio échouée: %s", exc)
         return {"lufs_i": None, "dBTP": None, "corr": None}, {}
 
-def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") -> Dict[str, Any]:
+def run_session(plan: Dict[str, Any] | SessionPlan, config_path: str = "config.yaml") -> Dict[str, Any]:
     cfg = load_config_safe(config_path)
     root_logger = logging.getLogger()
     if not root_logger.handlers:
         level_name = str(cfg.get("logging", {}).get("level", "INFO")).upper()
         level = getattr(logging, level_name, logging.INFO)
         logging.basicConfig(level=level)
-    _ensure_dirs(cfg["paths"]["output"], cfg["paths"]["midi_export"])
-    seed = int(session_plan.get("seed", cfg["project"]["seed"]))
+
+    paths_cfg = cfg["paths"]
+    output_dir = paths_cfg["output"]
+    midi_dir = paths_cfg["midi_export"]
+    _ensure_dirs(output_dir, midi_dir)
+
+    if isinstance(plan, SessionPlan):
+        session_plan = plan
+        style = session_plan.style
+        if style not in cfg["styles"]:
+            raise KeyError(f"Style inconnu '{style}' dans la configuration.")
+    elif isinstance(plan, dict):
+        if "style" not in plan:
+            raise KeyError("Le plan de session doit préciser un 'style'.")
+        style = str(plan["style"])
+        if style not in cfg["styles"]:
+            raise KeyError(f"Style inconnu '{style}' dans la configuration.")
+        bpm = float(plan.get("bpm", cfg["styles"][style].get("bpm_default", cfg["audio"].get("tempo_default", 120.0))))
+        duration = float(plan.get("duration_s", plan.get("duration", 84.0)))
+        seed = int(plan.get("seed", cfg.get("project", {}).get("seed", 0)))
+        sections = plan.get("sections") or list(cfg["styles"][style].get("structure", []))
+        session_plan = SessionPlan(style=style, bpm=bpm, seed=seed, duration_s=duration, sections=sections)
+    else:
+        raise TypeError("Le plan de session doit être un dictionnaire ou un SessionPlan.")
+
+    seed = int(session_plan.seed)
     _init_rng(seed)
 
-    style = session_plan["style"]
-    if style not in cfg["styles"]:
-        raise KeyError(f"Style inconnu '{style}' dans la configuration.")
-    bpm   = float(session_plan.get("bpm", cfg["styles"][style]["bpm_default"]))
-    dur   = float(session_plan.get("duration_s", 84.0))
-    sections = cfg["styles"][style]["structure"]
-    plan = SessionPlan(style=style, bpm=bpm, seed=seed, duration_s=dur, sections=sections)
+    sections = session_plan.sections or list(cfg["styles"][session_plan.style].get("structure", []))
+    if not sections:
+        sections = ["intro", "outro"]
+    session_plan = SessionPlan(
+        style=session_plan.style,
+        bpm=float(session_plan.bpm),
+        seed=seed,
+        duration_s=float(session_plan.duration_s),
+        sections=sections,
+    )
+
+    session_slug = _sanitize_component(
+        cfg.get("project", {}).get("name", "project"),
+        session_plan.style,
+        f"seed{session_plan.seed}",
+    )
+    session_dir = os.path.join(output_dir, session_slug)
+    _ensure_dirs(session_dir)
+
+    filename_ctx = {
+        "project": _sanitize_component(cfg.get("project", {}).get("name", "project")),
+        "style": _sanitize_component(session_plan.style),
+        "bpm": int(round(session_plan.bpm)),
+        "seed": session_plan.seed,
+    }
 
     drop_protocols = cfg.get("_assets", {}).get("drop_protocols", {})
     arranger = ArrangementEngine(
@@ -540,8 +633,7 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
     )
     modmat, drop_routes = _wire_modmatrix_drop(cfg, arranger)
 
-    # Rendu (placeholder)
-    tracks = _render_tracks(plan, cfg)
+    tracks = _render_tracks(session_plan, cfg)
     mx = MixerEngine(cfg)
     names = list(tracks.keys())
     mx.set_track_order(names)
@@ -555,7 +647,7 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
             settings["reverb_send"] = 0.10
         mx.configure_track(name, **settings)
 
-    _apply_style_to_mixer(cfg, plan.style, mx, plan.bpm)
+    _apply_style_to_mixer(cfg, session_plan.style, mx, session_plan.bpm)
 
     drop_destinations = arranger.prepare_destination_context(mx, drop_routes)
     if drop_destinations:
@@ -563,8 +655,7 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
         arranger.apply_final_values_to_mixer(mx, drop_destinations)
     drop_summary = arranger.summarise_modulations(drop_destinations) if drop_destinations else []
 
-    # appliquer fx_overrides aux bus
-    fxov = cfg["styles"][plan.style].get("fx_overrides", {})
+    fxov = cfg["styles"][session_plan.style].get("fx_overrides", {})
     reverb_overrides: Dict[str, Any] = {}
     if "reverb_mix" in fxov:
         reverb_overrides["mix"] = float(fxov["reverb_mix"])
@@ -580,28 +671,40 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
             decay=reverb_overrides.get("decay", mx.cfg_fx_reverb_decay),
             room_size=reverb_overrides.get("room_size", mx.cfg_fx_reverb_room_size),
             pre_delay=reverb_overrides.get("pre_delay", mx.cfg_fx_reverb_pre_delay),
-            tempo_bpm=plan.bpm,
+            tempo_bpm=session_plan.bpm,
         )
     if "delay_time" in fxov:
-        mx.configure_delay(time=fxov["delay_time"],
-                           feedback=mx.cfg_fx_delay_feedback,
-                           mix=mx.cfg_fx_delay_mix,
-                           tempo_bpm=plan.bpm)
+        mx.configure_delay(
+            time=fxov["delay_time"],
+            feedback=mx.cfg_fx_delay_feedback,
+            mix=mx.cfg_fx_delay_mix,
+            tempo_bpm=session_plan.bpm,
+        )
 
-    sc_sources = {}
-    for r in cfg["styles"][style].get("sidechain_routes", []):
+    sc_sources: Dict[str, np.ndarray] = {}
+    for r in cfg["styles"][session_plan.style].get("sidechain_routes", []):
         src = r["src"]
         if src in tracks:
             sc_sources[src] = tracks[src]
 
-    # MixerEngine guarantees a stereo float32 buffer and applies the sole limiter in the pipeline.
-    stereo = mx.render_mix(tracks,
-                           sidechain_kick=tracks.get("kick", None),
-                           sidechain_sources=sc_sources)
+    stereo = mx.render_mix(
+        tracks,
+        sidechain_kick=tracks.get("kick", None),
+        sidechain_sources=sc_sources,
+    )
 
-    outs, cc_used, cc_origin_stats = _export_audio_and_midi(stereo, tracks, cfg, plan, cfg["paths"]["output"])
+    outs, cc_used, cc_origin_stats = _export_audio_and_midi(
+        stereo,
+        tracks,
+        cfg,
+        session_plan,
+        session_dir,
+        midi_dir,
+        filename_ctx,
+    )
+
     if cfg["analysis"].get("run_after_export", False):
-        metrics, analysis_eval = _analyze(stereo, cfg, plan.style)
+        metrics, analysis_eval = _analyze(stereo, cfg, session_plan.style)
     else:
         metrics, analysis_eval = {}, {}
 
@@ -614,34 +717,41 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
             hyp_count,
         )
 
+    report_name = _fmt_name(cfg["export"]["filenames"]["report"], **filename_ctx)
+    report_path = os.path.join(session_dir, report_name)
+
+    paths_info: Dict[str, Any] = dict(outs)
+    paths_info["session_dir"] = session_dir
+    paths_info["report"] = report_path
+
     report = {
-        "project": cfg["project"]["name"],
-        "version": cfg["project"]["version"],
+        "project": cfg.get("project", {}).get("name", "dawless"),
+        "version": cfg.get("project", {}).get("version", "unknown"),
         "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "seed": seed,
-        "style": style,
-        "bpm": bpm,
-        "duration_s": dur,
-        "sections": sections,
+        "seed": session_plan.seed,
+        "style": session_plan.style,
+        "bpm": session_plan.bpm,
+        "duration_s": session_plan.duration_s,
+        "sections": session_plan.sections,
         "targets": {
-            "lufs": float(cfg["styles"][style]["target_lufs"]),
-            "dBTP": float(cfg["export"]["target_peak_dbtp"]),
-            "mono_bass_hz": int(cfg["audio"]["mono_bass_hz"])
+            "lufs": float(cfg["styles"][session_plan.style].get("target_lufs", -12.0)),
+            "dBTP": float(cfg["export"].get("target_peak_dbtp", -0.3)),
+            "mono_bass_hz": int(cfg["audio"].get("mono_bass_hz", 150)),
         },
         "metrics": metrics,
         "analysis_evaluation": analysis_eval,
-        "sc_routes": [f"{r['src']}->{r['dst']}" for r in cfg["styles"][style].get("sidechain_routes", [])],
+        "sc_routes": [
+            f"{r['src']}->{r['dst']}" for r in cfg["styles"][session_plan.style].get("sidechain_routes", [])
+        ],
         "cc_used": cc_used,
         "cc_origin_stats": cc_origin_stats,
-        "device_map": cfg.get("midi_cc",{}).get("device_map",{}),
+        "device_map": cfg.get("midi_cc", {}).get("device_map", {}),
         "drops": drop_summary,
-        "paths": outs,
-        "schema_version": cfg["logging"]["report_schema_version"]
+        "paths": paths_info,
+        "schema_version": "1.0",
     }
-    rep_name = _fmt_name(cfg["export"]["filenames"]["report"],
-                         project=cfg["project"]["name"], style=style, bpm=int(bpm), seed=seed)
-    rep_path = os.path.join(cfg["paths"]["output"], rep_name)
-    with open(rep_path, "w", encoding="utf-8") as f:
+
+    with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
     return report
