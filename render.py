@@ -244,6 +244,13 @@ def _apply_style_to_mixer(cfg: Dict[str, Any], style: str, mixer: MixerEngine, b
         mix=float(fxd.get("delay_mix", 0.25)),
         tempo_bpm=bpm,
     )
+    mixer.configure_reverb(
+        mix=float(fxd.get("reverb_mix", 0.22)),
+        decay=float(fxd.get("reverb_decay", 0.6)),
+        room_size=float(fxd.get("reverb_room_size", 0.8)),
+        pre_delay=fxd.get("reverb_pre_delay", "1/64"),
+        tempo_bpm=bpm,
+    )
     mixer.clear_sidechains()
     style_cfg = cfg["styles"][style]
     for r in style_cfg.get("sidechain_routes", []):
@@ -424,14 +431,23 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
 
     # appliquer fx_overrides aux bus
     fxov = cfg["styles"][plan.style].get("fx_overrides", {})
-    if "reverb_mix" in fxov:   mx.reverb_bus.mix = float(fxov["reverb_mix"])
+    reverb_overrides: Dict[str, Any] = {}
+    if "reverb_mix" in fxov:
+        reverb_overrides["mix"] = float(fxov["reverb_mix"])
     if "reverb_decay" in fxov:
-        fac = max(0.2, min(1.2, float(fxov["reverb_decay"])))
-        mx.reverb_bus.gains = [max(0.5, min(0.99, g*fac)) for g in mx.reverb_bus.gains]
-    if "reverb_room_size" in cfg.get("fx_defaults", {}):
-        rs = float(cfg["fx_defaults"]["reverb_room_size"])
-        rs = max(0.5, min(1.5, rs))
-        mx.reverb_bus.delays = [max(1, int(d*rs)) for d in mx.reverb_bus.delays]
+        reverb_overrides["decay"] = float(fxov["reverb_decay"])
+    if "reverb_room_size" in fxov:
+        reverb_overrides["room_size"] = float(fxov["reverb_room_size"])
+    if "reverb_pre_delay" in fxov:
+        reverb_overrides["pre_delay"] = fxov["reverb_pre_delay"]
+    if reverb_overrides:
+        mx.configure_reverb(
+            mix=reverb_overrides.get("mix", mx.cfg_fx_reverb_mix),
+            decay=reverb_overrides.get("decay", mx.cfg_fx_reverb_decay),
+            room_size=reverb_overrides.get("room_size", mx.cfg_fx_reverb_room_size),
+            pre_delay=reverb_overrides.get("pre_delay", mx.cfg_fx_reverb_pre_delay),
+            tempo_bpm=plan.bpm,
+        )
     if "delay_time" in fxov:
         mx.configure_delay(time=fxov["delay_time"],
                            feedback=mx.cfg_fx_delay_feedback,
