@@ -1,11 +1,16 @@
 # /mnt/data/arrangement_engine.py
+from typing import Any, Dict, Optional
+
 import yaml
 
 class ArrangementEngine:
-    def __init__(self, protocols_path: str = 'DROP_PROTOCOLS.yaml'):
+    def __init__(self, protocols_path: str = 'DROP_PROTOCOLS.yaml', protocols: Optional[Dict[str, Any]] = None):
         self.protocols_path = protocols_path
-        with open(self.protocols_path, 'r', encoding='utf-8') as f:
-            self.protocols = yaml.safe_load(f) or {}
+        if protocols is not None:
+            self.protocols = dict(protocols)
+        else:
+            with open(self.protocols_path, 'r', encoding='utf-8') as f:
+                self.protocols = yaml.safe_load(f) or {}
 
     def get_protocol(self, name: str) -> dict:
         return self.protocols.get(name, {})

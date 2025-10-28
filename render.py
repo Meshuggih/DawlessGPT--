@@ -1,7 +1,14 @@
 # /mnt/data/render.py
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
-import json, time, os, yaml, struct, wave
+from typing import Dict, Any, List, Optional, Tuple
+import copy
+import json
+import os
+import time
+import warnings
+import yaml
+import struct
+import wave
 import numpy as np
 
 from mixer_engine import MixerEngine
@@ -12,6 +19,204 @@ from midi_cc_db import CCResolver
 from sequencer import Sequencer, Pattern, Step
 from fx_processors import Delay
 
+CONFIG_CACHE: Dict[str, Dict[str, Any]] = {}
+ASSET_CACHE: Dict[str, Any] = {}
+
+_DEFAULT_AUDIO = {
+    "sample_rate": 44100,
+    "bit_depth": 24,
+    "buffer": 512,
+    "time_signature": "4/4",
+    "tempo_default": 120,
+    "key_default": "Cm",
+    "tuning_ref_hz": 440.0,
+    "mono_bass_hz": 150,
+}
+
+_DEFAULT_ASSET_PATHS = {
+    "style_templates": "./STYLE_TEMPLATES.json",
+    "drop_protocols": "./DROP_PROTOCOLS.yaml",
+    "synth_presets": "./SYNTH_PRESETS.json",
+    "drum_kits": "./DRUM_KITS.json",
+    "studio_theory": "./STUDIO_THEORY.json",
+    "studio_config": "./STUDIO_CONFIG.json",
+    "cc_overrides": "./cc_mappings.json",
+}
+
+_DEFAULT_PATHS = {
+    "base": ".",
+    "output": "./output",
+    "midi_export": "./midi_export",
+    "assets": _DEFAULT_ASSET_PATHS,
+}
+
+_ASSET_ALIASES = {
+    "style_templates": ("STYLE_TEMPLATES.json", "STYLE_TEMPLATE.json"),
+}
+
+_ASSET_VALIDATORS: Dict[str, Tuple[type, str]] = {
+    "style_templates": (dict, "Le fichier de templates de styles doit contenir un objet JSON."),
+    "drop_protocols": (dict, "Les protocoles de drop doivent être une table YAML."),
+    "synth_presets": (dict, "Les presets synthé doivent être un objet JSON."),
+    "drum_kits": (dict, "Les kits de batterie doivent être un objet JSON."),
+    "studio_theory": (dict, "La théorie studio doit être un objet JSON."),
+    "studio_config": (dict, "La configuration studio doit être un objet JSON."),
+    "cc_mappings": (dict, "Les mappings CC doivent être un objet JSON."),
+}
+
+
+def _resolve_path(base_dir: str, value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    path = os.path.expanduser(str(value))
+    if not os.path.isabs(path):
+        path = os.path.abspath(os.path.join(base_dir, path))
+    return path
+
+
+def load_asset(name: str, path: str, *, use_cache: bool = True) -> Any:
+    """Load an asset file (JSON or YAML) with light validation and caching."""
+
+    if not path:
+        raise ValueError(f"Chemin vide pour l'asset '{name}'.")
+
+    abs_path = os.path.abspath(path)
+    if use_cache and abs_path in ASSET_CACHE:
+        return copy.deepcopy(ASSET_CACHE[abs_path])
+
+    candidate_paths = [abs_path]
+    for alt in _ASSET_ALIASES.get(name, ()):  # try known aliases
+        if not os.path.isabs(alt):
+            candidate_paths.append(os.path.join(os.path.dirname(abs_path), alt))
+        else:
+            candidate_paths.append(alt)
+
+    actual_path = None
+    for candidate in candidate_paths:
+        if os.path.exists(candidate):
+            actual_path = candidate
+            break
+    if actual_path is None:
+        raise FileNotFoundError(f"Asset '{name}' introuvable (recherché: {candidate_paths}).")
+
+    _, ext = os.path.splitext(actual_path)
+    ext = ext.lower()
+    with open(actual_path, "r", encoding="utf-8") as f:
+        if ext in (".yaml", ".yml"):
+            data = yaml.safe_load(f) or {}
+        elif ext == ".json":
+            text = f.read()
+            lines = [ln for ln in text.splitlines() if not ln.strip().startswith("//")]
+            cleaned = "\n".join(lines)
+            data = json.loads(cleaned or "{}")
+        else:
+            raise ValueError(f"Extension de fichier non supportée pour l'asset '{name}': {ext}")
+
+    expected_type, err_msg = _ASSET_VALIDATORS.get(name, (dict, ""))
+    if expected_type and not isinstance(data, expected_type):
+        warnings.warn(err_msg or f"Asset '{name}' invalide: type attendu {expected_type}.")
+        data = expected_type()  # type: ignore[call-arg]
+
+    snapshot = copy.deepcopy(data)
+    ASSET_CACHE[abs_path] = copy.deepcopy(snapshot)
+    ASSET_CACHE[actual_path] = copy.deepcopy(snapshot)
+    return snapshot
+
+
+def load_config_safe(path: str = "config.yaml", *, use_cache: bool = True) -> Dict[str, Any]:
+    """Load YAML config safely, injecting defaults and caching the result."""
+
+    abs_path = os.path.abspath(path)
+    if use_cache and abs_path in CONFIG_CACHE:
+        return copy.deepcopy(CONFIG_CACHE[abs_path])
+
+    base_dir = os.path.dirname(abs_path)
+    try:
+        with open(abs_path, "r", encoding="utf-8") as f:
+            cfg_raw = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        warnings.warn(f"Fichier de configuration '{path}' introuvable. Utilisation des valeurs par défaut.")
+        cfg_raw = {}
+
+    if not isinstance(cfg_raw, dict):
+        warnings.warn("La configuration doit être une structure de type dictionnaire. Valeurs par défaut appliquées.")
+        cfg_raw = {}
+
+    cfg: Dict[str, Any] = copy.deepcopy(cfg_raw)
+
+    def _ensure_section(key: str, defaults: Dict[str, Any]) -> Dict[str, Any]:
+        section = cfg.get(key)
+        if not isinstance(section, dict):
+            warnings.warn(f"Section '{key}' manquante ou invalide — utilisation des valeurs par défaut.")
+            section = copy.deepcopy(defaults)
+        else:
+            for sub_key, default_value in defaults.items():
+                if isinstance(default_value, dict):
+                    sub_section = section.get(sub_key)
+                    if not isinstance(sub_section, dict):
+                        warnings.warn(f"Clé '{key}.{sub_key}' manquante ou invalide — valeurs par défaut injectées.")
+                        section[sub_key] = copy.deepcopy(default_value)
+                    else:
+                        for leaf_key, leaf_default in default_value.items():
+                            if leaf_key not in sub_section:
+                                sub_section[leaf_key] = copy.deepcopy(leaf_default)
+                else:
+                    section.setdefault(sub_key, copy.deepcopy(default_value))
+        cfg[key] = section
+        return section
+
+    _ensure_section("audio", _DEFAULT_AUDIO)
+    paths = _ensure_section("paths", _DEFAULT_PATHS)
+    styles = cfg.get("styles")
+    if not isinstance(styles, dict):
+        warnings.warn("Section 'styles' manquante ou invalide — dictionnaire vide utilisé.")
+        styles = {}
+    cfg["styles"] = styles
+
+    paths["base"] = _resolve_path(base_dir, paths.get("base", base_dir)) or base_dir
+    for key in ("output", "midi_export"):
+        paths[key] = _resolve_path(paths["base"], paths.get(key, _DEFAULT_PATHS[key]))
+
+    assets_cfg = paths.get("assets", {})
+    if not isinstance(assets_cfg, dict):
+        warnings.warn("Section 'paths.assets' invalide — valeurs par défaut utilisées.")
+        assets_cfg = copy.deepcopy(_DEFAULT_ASSET_PATHS)
+    for asset_key, default_path in _DEFAULT_ASSET_PATHS.items():
+        raw_value = assets_cfg.get(asset_key, default_path)
+        if asset_key not in assets_cfg or raw_value is None:
+            warnings.warn(f"Chemin pour l'asset '{asset_key}' manquant — valeur par défaut utilisée.")
+            raw_value = default_path
+        resolved = _resolve_path(paths["base"], raw_value)
+        assets_cfg[asset_key] = resolved if resolved is not None else _resolve_path(paths["base"], default_path)
+    paths["assets"] = assets_cfg
+
+    cfg["_base_dir"] = paths["base"]
+
+    loaded_assets: Dict[str, Any] = {}
+    for asset_key in (
+        "style_templates",
+        "drop_protocols",
+        "synth_presets",
+        "drum_kits",
+        "studio_theory",
+        "studio_config",
+        "cc_overrides",
+    ):
+        asset_path = assets_cfg.get(asset_key)
+        if not asset_path:
+            continue
+        try:
+            loaded_assets[asset_key] = load_asset(asset_key, asset_path)
+        except FileNotFoundError as exc:
+            warnings.warn(str(exc))
+        except Exception as exc:
+            warnings.warn(f"Échec du chargement de l'asset '{asset_key}': {exc}")
+
+    cfg["_assets"] = loaded_assets
+
+    CONFIG_CACHE[abs_path] = copy.deepcopy(cfg)
+    return copy.deepcopy(cfg)
+
 @dataclass
 class SessionPlan:
     style: str
@@ -19,10 +224,6 @@ class SessionPlan:
     seed: int
     duration_s: float
     sections: List[str]
-
-def _load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 def _fmt_name(template: str, **kw) -> str:
     return template.format(**kw)
@@ -117,10 +318,13 @@ def _export_audio_and_midi(stereo: np.ndarray, trackbufs: Dict[str, np.ndarray],
     ts = (cfg["audio"].get("time_signature","4/4") or "4/4").split("/")
     midifile.set_time_signature(int(ts[0]), int(ts[1]))
 
+    assets = cfg.get("_assets", {})
     resolver = CCResolver(
-        studio_config_path=cfg["paths"]["assets"]["studio_config"],
-        cc_overrides_path=cfg["paths"]["assets"].get("cc_overrides", None),
-        fallback_profile=cfg["midi_cc"]["fallback_profile"]
+        studio_config_path=cfg["paths"]["assets"].get("studio_config"),
+        cc_overrides_path=cfg["paths"]["assets"].get("cc_overrides"),
+        fallback_profile=cfg.get("midi_cc", {}).get("fallback_profile", {}),
+        studio_config=assets.get("studio_config"),
+        cc_overrides=assets.get("cc_overrides"),
     )
     seq = Sequencer(ticks_per_beat=480)
     hp_name = cfg["styles"][plan.style].get("humanize_profile", None)
@@ -182,18 +386,21 @@ def _analyze(stereo: np.ndarray, cfg: Dict[str, Any]) -> Dict[str, float]:
         return {"lufs_i": -999.0, "dBTP": 0.0, "corr": 1.0}
 
 def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") -> Dict[str, Any]:
-    cfg = _load_config(config_path)
+    cfg = load_config_safe(config_path)
     _ensure_dirs(cfg["paths"]["output"], cfg["paths"]["midi_export"])
     seed = int(session_plan.get("seed", cfg["project"]["seed"]))
     _init_rng(seed)
 
     style = session_plan["style"]
+    if style not in cfg["styles"]:
+        raise KeyError(f"Style inconnu '{style}' dans la configuration.")
     bpm   = float(session_plan.get("bpm", cfg["styles"][style]["bpm_default"]))
     dur   = float(session_plan.get("duration_s", 84.0))
     sections = cfg["styles"][style]["structure"]
     plan = SessionPlan(style=style, bpm=bpm, seed=seed, duration_s=dur, sections=sections)
 
-    arranger = ArrangementEngine(cfg["paths"]["assets"]["drop_protocols"])
+    drop_protocols = cfg.get("_assets", {}).get("drop_protocols", {})
+    arranger = ArrangementEngine(protocols_path=cfg["paths"]["assets"]["drop_protocols"], protocols=drop_protocols)
     modmat = _wire_modmatrix_drop(cfg, arranger)
 
     # Rendu (placeholder)
