@@ -389,6 +389,47 @@ def main() -> None:
             raise RuntimeError("Échec self-test CC: informations de piste manquantes dans le résumé CC.")
         print("[Σ] self-test CC stats — origines et comptages cohérents.")
 
+        from arrangement_engine import ArrangementEngine
+        from modulation_matrix import DropBusSource, ModulationMatrix
+
+        drop_assets = cfg.get("paths", {}).get("assets", {})
+        drop_path = drop_assets.get("drop_protocols", "DROP_PROTOCOLS.yaml")
+        drop_cache = cfg.get("_assets", {}).get("drop_protocols", {})
+        arranger_test = ArrangementEngine(protocols_path=str(drop_path), protocols=drop_cache)
+        drop_bus_name = cfg.get("modulation_matrix", {}).get("drop_bus_name", "DROP")
+
+        drop_matrix = ModulationMatrix(sum_mode="weighted_clamp")
+        drop_source = DropBusSource(
+            "filter_sweep_master",
+            bus=drop_bus_name,
+            protocols_path=str(drop_path),
+            protocols=arranger_test.protocols,
+        )
+        drop_matrix.add(drop_source, "pad.reverb_send", amt=1.0, rng=(0.0, 0.85), curve="exp")
+
+        drop_mixer = MixerEngine(cfg)
+        drop_mixer.set_track_order(["pad"])
+        drop_mixer.configure_track("pad", reverb_send=0.35)
+
+        drop_routes = [
+            {"protocol": "filter_sweep_master", "destination": "pad.reverb_send", "range": (0.0, 0.85)}
+        ]
+        destinations = arranger_test.prepare_destination_context(drop_mixer, drop_routes)
+        beats = [0.0, 2.0, 4.0, 6.0, 8.0, 12.0, 16.0]
+        arranger_test.apply_modulations(drop_matrix, destinations, beats=beats)
+        summary = arranger_test.summarise_modulations(destinations)
+        pad_summary = next((entry for entry in summary if entry["destination"] == "pad.reverb_send"), None)
+        if not pad_summary:
+            raise RuntimeError("Échec self-test drop bus: destination pad.reverb_send non trouvée.")
+        avg_abs_delta = float(pad_summary.get("average_abs_delta", 0.0))
+        if avg_abs_delta <= 0.05:
+            raise RuntimeError(
+                f"Échec self-test drop bus: Δ moyen absolu {avg_abs_delta:.3f} ≤ 0.050."
+            )
+        print(
+            f"[Σ] self-test drop bus — Δ moyen absolu {avg_abs_delta:.3f} sur pad.reverb_send."
+        )
+
         print("[Σ] self-test ok — budget fichiers respecté et configuration chargée.")
         return
 
