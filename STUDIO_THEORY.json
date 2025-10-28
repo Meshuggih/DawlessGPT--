@@ -1,0 +1,6 @@
+// /mnt/data/STUDIO_THEORY.json
+{
+  "scales": { "minor": [0,2,3,5,7,8,10], "major": [0,2,4,5,7,9,11], "phrygian": [0,1,3,5,7,8,10] },
+  "chords": { "minor_triad": [0,3,7], "major_triad": [0,4,7] },
+  "euclidean_patterns": { "kick_4_4": {"steps":16, "fills":4}, "hat_even": {"steps":16, "fills":8} }
+}

@@ -1,0 +1,2 @@
+// /mnt/data/DRUM_KITS.json
+{ "909": { "kick": {"decay":0.5,"drive":0.3,"tone":0.5}, "snare":{"decay":0.4,"tone":0.6,"snappy":0.7}, "hat_c":{"decay":0.1,"tone":0.7}, "hat_o":{"decay":0.5,"tone":0.6} } }

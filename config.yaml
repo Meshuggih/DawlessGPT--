@@ -1,0 +1,135 @@
+# /mnt/data/config.yaml
+project:
+  name: "dawless_sigma"
+  version: "1.0"
+  seed: 1337
+  date_utc: auto
+
+audio:
+  sample_rate: 48000
+  bit_depth: 24
+  buffer: 512
+  time_signature: "4/4"
+  tempo_default: 120
+  key_default: "Cm"
+  tuning_ref_hz: 440.0
+  mono_bass_hz: 150
+
+export:
+  format: "wav"
+  render_master: true
+  render_stems: true
+  normalize: true
+  dither: true
+  target_peak_dbtp: -0.3
+  headroom_db: 1.0
+  filenames:
+    master: "{project}_{style}_{bpm}bpm_seed{seed}_master.wav"
+    stem:   "{project}_{style}_{bpm}bpm_seed{seed}_{track}.wav"
+    midi:   "{project}_{style}_{bpm}bpm_seed{seed}.mid"
+    report: "{project}_{style}_{bpm}bpm_seed{seed}_report.json"
+
+analysis:
+  run_after_export: true
+  metrics: ["lufs_i","dbtp","correlation","mono_bass_check","clicks"]
+  tolerances:
+    lufs_i: { techno_peak: [-10.5, -9.5], house_deep: [-12.5,-11.5], ambient: [-17,-15], trance: [-10,-9], dnb: [-9,-8], synthwave: [-13,-12] }
+    dbtp_max: -0.3
+    correlation_min: 0.60
+
+paths:
+  base: "."
+  output: "./output"
+  midi_export: "./midi_export"
+  assets:
+    style_templates: "./STYLE_TEMPLATES.json"
+    drop_protocols: "./DROP_PROTOCOLS.yaml"
+    synth_presets: "./SYNTH_PRESETS.json"
+    drum_kits: "./DRUM_KITS.json"
+    studio_theory: "./STUDIO_THEORY.json"
+    studio_config: "./STUDIO_CONFIG.json"
+    cc_overrides: "./cc_mappings.json"
+
+fx_defaults:
+  delay_time: "1/8."
+  delay_feedback: 0.4
+  delay_mix: 0.25
+  reverb_room_size: 0.7
+  reverb_decay: 0.8
+  reverb_mix: 0.22
+  saturator_drive: 0.0
+
+sidechain_defaults:
+  shape: "exp"
+  depth_db: 3.0
+  attack_ms: 5
+  release_ms: 80
+
+styles:
+  techno_peak:
+    bpm_default: 130
+    target_lufs: -10.0
+    width_hint: "moderate"
+    structure: ["intro","plateau","build","peak","breakdown","final"]
+    buses: { drums: ["kick","snare","hats","perc"], music: ["bass","stabs","pad","fx"] }
+    sidechain_routes:
+      - { src: "kick", dst: "bass", depth_db: 3.0, attack_ms: 5, release_ms: 80, shape: "exp" }
+      - { src: "kick", dst: "pad",  depth_db: 1.5, attack_ms: 10, release_ms: 120, shape: "exp" }
+    fx_overrides: { delay_time: "1/8.", reverb_mix: 0.18 }
+    humanize_profile: "swing_54"
+  ambient:
+    bpm_default: 90
+    target_lufs: -16.0
+    width_hint: "very_wide_safe_low"
+    structure: ["drift_in","plateau_a","bloom","plateau_b","dissolve"]
+    sidechain_routes:
+      - { src: "pulse", dst: "bed", depth_db: 0.8, attack_ms: 30, release_ms: 200, shape: "log" }
+    fx_overrides: { delay_time: "1/4.", reverb_mix: 0.35, reverb_decay: 1.2 }
+    humanize_profile: "ambient_soft"
+  dnb:
+    bpm_default: 174
+    target_lufs: -8.5
+    width_hint: "wide"
+    structure: ["intro","roll","switch","roll2","outro"]
+    sidechain_routes:
+      - { src: "break", dst: "sub", depth_db: 2.0, attack_ms: 3, release_ms: 70, shape: "exp" }
+    fx_overrides: { delay_time: "1/16" }
+    humanize_profile: "breaks_smart"
+
+humanize:
+  profiles:
+    swing_54:     { swing_pct: 54, time_ms: 0.0, vel_variation: 6, jitter_ms: 2.0, microtuning_cents: 0 }
+    ambient_soft: { swing_pct: 50, time_ms: 8.0, vel_variation: 8, jitter_ms: 4.0, microtuning_cents: 3 }
+    breaks_smart: { swing_pct: 53, time_ms: 2.0, vel_variation: 9, jitter_ms: 5.0, microtuning_cents: 0 }
+
+midi_cc:
+  policy: "prefer_real_else_hypothesis"
+  device_map:
+    bass:   "moog_minitaur"
+    stabs:  "subsequent_37"
+    pad:    "roland_juno106"
+    keys:   "generic_synth"
+    drums:  "tr_909"
+  fallback_profile:
+    modulation: 1
+    volume: 7
+    pan: 10
+    expression: 11
+    sustain_pedal: 64
+    cutoff: 74
+    resonance: 71
+    attack: 73
+    release: 72
+    reverb_send: 91
+    chorus_send: 93
+    delay_send: 94
+
+modulation_matrix:
+  macros: ["MacroA","MacroB","MacroC","MacroD"]
+  drop_bus_name: "DROP"
+  sum_mode: "weighted_clamp"
+
+logging:
+  level: "INFO"
+  write_session_report: true
+  report_schema_version: "1.0"

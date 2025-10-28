@@ -1,0 +1,6 @@
+// /mnt/data/STYLE_TEMPLATES.json
+{
+  "techno_peak": { "bpm": 130, "structure": ["intro","plateau","build","peak","breakdown","final"], "tracks": ["kick","snare","hats","perc","bass","stabs","pad","fx"] },
+  "ambient":     { "bpm": 90,  "structure": ["drift_in","plateau_a","bloom","plateau_b","dissolve"], "tracks": ["pulse","bed","drone","keys","fx"] },
+  "dnb":         { "bpm": 174, "structure": ["intro","roll","switch","roll2","outro"], "tracks": ["break","sub","perc","keys","pad"] }
+}

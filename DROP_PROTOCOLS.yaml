@@ -1,0 +1,5 @@
+# /mnt/data/DROP_PROTOCOLS.yaml
+filter_sweep_master:
+  curve: [[0, 0.0], [8, 1.0], [16, 0.0]]
+reverb_wash_bass_filter:
+  curve: [[0, 0.0], [4, 0.6], [8, 1.0], [12, 0.2]]

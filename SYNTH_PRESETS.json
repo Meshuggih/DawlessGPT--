@@ -1,0 +1,6 @@
+// /mnt/data/SYNTH_PRESETS.json
+{
+  "acid_303": { "type": "mono_bass", "cutoff": 800, "resonance": 0.7, "envelope_mod": 0.8, "decay": 0.4, "accent": 0.5 },
+  "warm_pad": { "type": "poly_pad",  "num_harmonics": 16, "harmonic_decay": 0.7, "cutoff": 1500, "resonance": 0.3, "attack": 1.0, "decay": 0.5, "sustain": 0.9, "release": 2.0 },
+  "house_chords": { "type": "poly_chord", "osc1_wave": "saw", "osc2_wave": "square", "osc3_wave": "saw", "osc4_wave": "triangle", "cutoff": 1200, "resonance": 0.4, "chorus_depth": 0.5, "chorus_rate": 0.3, "env_adsr": [0.05, 0.3, 0.7, 0.5] }
+}

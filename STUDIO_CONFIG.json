@@ -1,0 +1,15 @@
+// /mnt/data/STUDIO_CONFIG.json
+{
+  "midi_cc_hardware": {
+    "moog_minitaur":   { "cutoff": 74, "resonance": 71, "glide": 5, "volume": 7, "reverb_send": 91, "delay_send": 94 },
+    "subsequent_37":   { "cutoff": 74, "resonance": 71, "filter_eg_amount": 21, "amp_attack": 26, "amp_decay": 27, "amp_sustain": 28, "amp_release": 29, "lfo_rate": 3, "lfo_amount": 13, "glide": 5, "volume": 7, "reverb_send": 91, "delay_send": 94 },
+    "roland_tb303":    { "cutoff": 74, "resonance": 71, "envelope_mod": 24, "decay": 28, "accent": 11, "volume": 7 },
+    "roland_juno106":  { "cutoff": 74, "resonance": 71, "reverb_send": 91, "chorus_send": 93 },
+    "generic_synth":   { "modulation": 1, "volume": 7, "pan": 10, "expression": 11, "sustain_pedal": 64, "cutoff": 74, "resonance": 71, "attack": 73, "release": 72, "reverb_send": 91, "chorus_send": 93, "delay_send": 94 }
+  },
+  "humanize_profiles": {
+    "swing_54":     { "swing_pct": 54, "time_ms": 0.0, "vel_variation": 6, "jitter_ms": 2.0, "microtuning_cents": 0 },
+    "ambient_soft": { "swing_pct": 50, "time_ms": 8.0, "vel_variation": 8, "jitter_ms": 4.0, "microtuning_cents": 3 },
+    "breaks_smart": { "swing_pct": 53, "time_ms": 2.0, "vel_variation": 9, "jitter_ms": 5.0, "microtuning_cents": 0 }
+  }
+}
