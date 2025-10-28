@@ -17,7 +17,6 @@ from modulation_matrix import ModulationMatrix
 from midi_writer import MIDIFile
 from midi_cc_db import CCResolver
 from sequencer import Sequencer, Pattern, Step
-from fx_processors import Delay
 
 CONFIG_CACHE: Dict[str, Dict[str, Any]] = {}
 ASSET_CACHE: Dict[str, Any] = {}
@@ -239,10 +238,13 @@ def _ensure_dirs(*paths):
 
 def _apply_style_to_mixer(cfg: Dict[str, Any], style: str, mixer: MixerEngine, bpm: float):
     fxd = cfg.get("fx_defaults", {})
-    mixer.cfg_fx_delay_time     = fxd.get("delay_time", "1/8.")
-    mixer.cfg_fx_delay_feedback = float(fxd.get("delay_feedback", 0.4))
-    mixer.cfg_fx_delay_mix      = float(fxd.get("delay_mix", 0.25))
-    mixer.tempo_bpm = bpm
+    mixer.configure_delay(
+        time=fxd.get("delay_time", "1/8."),
+        feedback=float(fxd.get("delay_feedback", 0.4)),
+        mix=float(fxd.get("delay_mix", 0.25)),
+        tempo_bpm=bpm,
+    )
+    mixer.clear_sidechains()
     style_cfg = cfg["styles"][style]
     for r in style_cfg.get("sidechain_routes", []):
         mixer.create_sc(r["src"], r["dst"], depth_db=r.get("depth_db", 3.0),
@@ -405,24 +407,20 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
 
     # Rendu (placeholder)
     tracks = _render_tracks(plan, cfg)
-    mx = MixerEngine(num_tracks=len(tracks), sample_rate=int(cfg["audio"]["sample_rate"]))
-    mx.master_pregain = 10.0**(-float(cfg["export"].get("headroom_db",1.0))/20.0)
-
-    # nommage + envois de base pour démo aux
-    mx.tracks = [type("Track", (), {"name": k, "volume_db": 0.0, "reverb_send": 0.0, "delay_send": 0.0, "pan": 0.0})() for k in tracks.keys()]
-    for tr in mx.tracks:
-        if tr.name == "pad": tr.reverb_send = 0.35
-        if tr.name == "stabs": setattr(tr, "delay_send", 0.25)
-        if tr.name == "bass": tr.reverb_send = 0.10
+    mx = MixerEngine(cfg)
+    names = list(tracks.keys())
+    mx.set_track_order(names)
+    for name in names:
+        settings = {"volume_db": 0.0, "pan": 0.0, "reverb_send": 0.0, "delay_send": 0.0}
+        if name == "pad":
+            settings["reverb_send"] = 0.35
+        if name == "stabs":
+            settings["delay_send"] = 0.25
+        if name == "bass":
+            settings["reverb_send"] = 0.10
+        mx.configure_track(name, **settings)
 
     _apply_style_to_mixer(cfg, plan.style, mx, plan.bpm)
-
-    # Recréer systématiquement le Delay bus selon les defaults/tempo
-    mx.delay_bus = Delay(int(cfg["audio"]["sample_rate"]),
-                         feedback=mx.cfg_fx_delay_feedback,
-                         mix=mx.cfg_fx_delay_mix,
-                         time=mx.cfg_fx_delay_time,
-                         tempo_bpm=plan.bpm)
 
     # appliquer fx_overrides aux bus
     fxov = cfg["styles"][plan.style].get("fx_overrides", {})
@@ -435,23 +433,19 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
         rs = max(0.5, min(1.5, rs))
         mx.reverb_bus.delays = [max(1, int(d*rs)) for d in mx.reverb_bus.delays]
     if "delay_time" in fxov:
-        mx.delay_bus = Delay(int(cfg["audio"]["sample_rate"]),
-                             feedback=mx.cfg_fx_delay_feedback,
-                             mix=mx.cfg_fx_delay_mix,
-                             time=fxov["delay_time"],
-                             tempo_bpm=plan.bpm)
+        mx.configure_delay(time=fxov["delay_time"],
+                           feedback=mx.cfg_fx_delay_feedback,
+                           mix=mx.cfg_fx_delay_mix,
+                           tempo_bpm=plan.bpm)
 
-    # construire sidechain_sources: index -> signal
-    names = list(tracks.keys())
-    idx_map = {name: i for i, name in enumerate(names)}
     sc_sources = {}
     for r in cfg["styles"][style].get("sidechain_routes", []):
         src = r["src"]
-        if src in idx_map:
-            si = idx_map[src]
-            sc_sources[si] = tracks[src]
+        if src in tracks:
+            sc_sources[src] = tracks[src]
 
-    stereo = mx.render_mix([tracks[k] for k in names],
+    # MixerEngine guarantees a stereo float32 buffer and applies the sole limiter in the pipeline.
+    stereo = mx.render_mix(tracks,
                            sidechain_kick=tracks.get("kick", None),
                            sidechain_sources=sc_sources)
 
