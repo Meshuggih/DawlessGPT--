@@ -254,9 +254,14 @@ def _apply_style_to_mixer(cfg: Dict[str, Any], style: str, mixer: MixerEngine, b
     mixer.clear_sidechains()
     style_cfg = cfg["styles"][style]
     for r in style_cfg.get("sidechain_routes", []):
-        mixer.create_sc(r["src"], r["dst"], depth_db=r.get("depth_db", 3.0),
-                        attack_ms=r.get("attack_ms", 5), release_ms=r.get("release_ms", 80),
-                        shape=r.get("shape", "exp"))
+        mixer.create_sidechain(
+            r["src"],
+            r["dst"],
+            depth_db=r.get("depth_db", 3.0),
+            attack_ms=r.get("attack_ms", 5),
+            release_ms=r.get("release_ms", 80),
+            shape=r.get("shape", "exp"),
+        )
 
 def _wire_modmatrix_drop(cfg: Dict[str, Any], arranger: ArrangementEngine) -> ModulationMatrix:
     mm = ModulationMatrix(sum_mode=cfg["modulation_matrix"]["sum_mode"])
