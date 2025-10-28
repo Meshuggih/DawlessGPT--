@@ -18,7 +18,13 @@ from arrangement_engine import ArrangementEngine
 from modulation_matrix import ModulationMatrix, DropBusSource
 from midi_writer import MIDIFile
 from midi_cc_db import CCResolver
-from sequencer import Sequencer, Pattern, Step
+from sequencer import (
+    Sequencer,
+    Pattern,
+    Step,
+    generate_pattern,
+    set_style_templates,
+)
 
 CONFIG_CACHE: Dict[str, Dict[str, Any]] = {}
 ASSET_CACHE: Dict[str, Any] = {}
@@ -344,12 +350,82 @@ def _wire_modmatrix_drop(
 
 def _render_tracks(plan: SessionPlan, cfg: Dict[str, Any]) -> Dict[str, np.ndarray]:
     sr = int(cfg["audio"]["sample_rate"])
-    N  = int(plan.duration_s * sr)
-    t  = np.arange(N)/sr
-    kick = (np.sin(2*np.pi*50*t) * (np.exp(-t*8))).astype(np.float32)
-    bass = (0.3*np.sin(2*np.pi*55*t)).astype(np.float32)
-    pad  = (0.05*np.sin(2*np.pi*0.2*t)).astype(np.float32)
-    return {"kick": kick, "bass": bass, "pad": pad}  # placeholders
+    N = int(plan.duration_s * sr)
+    t = np.arange(N) / sr
+    beat_duration = 60.0 / max(1e-6, float(plan.bpm))
+
+    pattern_steps = max(16, int(cfg.get("patterns", {}).get("steps", 16)))
+    generated = generate_pattern(plan.style, pattern_steps, plan.seed)
+
+    loop_beats = float(pattern_steps)
+    for step_list in generated.values():
+        for st in step_list:
+            loop_beats = max(loop_beats, float(st.beat) + float(st.length_beats))
+    loops = max(1, int(np.ceil((plan.duration_s / beat_duration) / loop_beats)))
+
+    def _schedule_hits(steps: List[Step], env: np.ndarray) -> np.ndarray:
+        buffer = np.zeros(N, dtype=np.float32)
+        hit_len = env.shape[0]
+        for loop in range(loops):
+            loop_offset_beats = loop * loop_beats
+            for st in steps:
+                if st.note is None:
+                    continue
+                start_time = (loop_offset_beats + float(st.beat)) * beat_duration
+                start_idx = int(round(start_time * sr))
+                if start_idx >= N:
+                    continue
+                amp = float(st.vel) / 127.0
+                end_idx = min(N, start_idx + hit_len)
+                seg = end_idx - start_idx
+                if seg <= 0:
+                    continue
+                buffer[start_idx:end_idx] += amp * env[:seg]
+        return buffer
+
+    # Kick: décroissance rapide inspirée d'un circuit analogique.
+    kick_len = int(0.8 * sr)
+    kick_t = np.arange(kick_len) / sr
+    kick_env = np.sin(2 * np.pi * 52.0 * kick_t) * np.exp(-kick_t * 9.5)
+    kick_steps = generated.get("kick", [])
+    kick = _schedule_hits(kick_steps, kick_env.astype(np.float32))
+
+    # Bass: reste un sinus simple pour servir de référence grave stable.
+    bass = (0.3 * np.sin(2 * np.pi * 55 * t)).astype(np.float32)
+
+    # Pad : arpège cyclique avec enveloppe douce et suivi de hauteur.
+    pad = np.zeros(N, dtype=np.float32)
+    pad_steps = generated.get("pad", [])
+    attack = int(0.25 * sr)
+    release = int(0.6 * sr)
+    for loop in range(loops):
+        loop_offset_beats = loop * loop_beats
+        for st in pad_steps:
+            if st.note is None:
+                continue
+            start_time = (loop_offset_beats + float(st.beat)) * beat_duration
+            length_s = max(beat_duration * float(st.length_beats), 0.5)
+            start_idx = int(round(start_time * sr))
+            if start_idx >= N:
+                continue
+            stop_idx = min(N, int(round((start_time + length_s) * sr)) + release)
+            if stop_idx <= start_idx:
+                continue
+            local_len = stop_idx - start_idx
+            local_t = np.arange(local_len) / sr
+            freq = 440.0 * (2.0 ** ((float(st.note) - 69.0) / 12.0))
+            osc = np.sin(2 * np.pi * freq * local_t)
+            env = np.ones(local_len)
+            a = min(attack, local_len)
+            if a > 0:
+                env[:a] *= np.linspace(0.0, 1.0, a, endpoint=False)
+            r = min(release, local_len)
+            if r > 0:
+                env[-r:] *= np.linspace(1.0, 0.0, r, endpoint=True)
+            vel = float(st.vel) / 127.0
+            pad[start_idx:stop_idx] += (vel * 0.3) * (osc * env)
+
+    return {"kick": kick.astype(np.float32), "bass": bass, "pad": pad.astype(np.float32)}
 
 def _float_to_int24_pcm(x: np.ndarray, dither: bool=False) -> bytes:
     x = np.clip(x, -1.0, 1.0)
@@ -440,6 +516,15 @@ def _export_audio_and_midi(
         seq.humanize = dict(time_ms=hp.get("time_ms", 0.0), vel_var=hp.get("vel_variation", 0))
 
     devmap = cfg.get("midi_cc", {}).get("device_map", {})
+    pattern_steps = max(16, int(cfg.get("patterns", {}).get("steps", 16)))
+    generated_patterns = generate_pattern(session_plan.style, pattern_steps, session_plan.seed)
+
+    kick_steps = generated_patterns.get("kick", [])
+    if kick_steps:
+        pat_kick = Pattern(channel=9, device=devmap.get("kick", "drum_machine"))
+        pat_kick.steps.extend(kick_steps)
+        seq.set_pattern("kick", pat_kick)
+
     pat_bass = Pattern(channel=0, device=devmap.get("bass", "moog_minitaur"))
     pat_bass.steps += [
         Step(beat=0.0, note=36, vel=110, length_beats=2.0),
@@ -456,11 +541,15 @@ def _export_audio_and_midi(
     ]
     seq.set_pattern("stabs", pat_stabs)
     pat_pad = Pattern(channel=2, device=devmap.get("pad", "roland_juno106"))
-    pat_pad.steps += [
-        Step(beat=0.0, note=48, vel=80, length_beats=4.0),
-        Step(beat=16.0, locks={"cutoff": 0.42}),
-        Step(beat=48.0, locks={"reverb_send": 0.65}),
-    ]
+    pad_steps = generated_patterns.get("pad")
+    if pad_steps:
+        pat_pad.steps.extend(pad_steps)
+    else:
+        pat_pad.steps += [
+            Step(beat=0.0, note=48, vel=80, length_beats=4.0),
+            Step(beat=16.0, locks={"cutoff": 0.42}),
+            Step(beat=48.0, locks={"reverb_send": 0.65}),
+        ]
     seq.set_pattern("pad", pat_pad)
     pat_keys = Pattern(channel=3, device=devmap.get("keys", "generic_synth"))
     pat_keys.steps += [
@@ -567,6 +656,7 @@ def _analyze(stereo: np.ndarray, cfg: Dict[str, Any], style: str) -> Tuple[Dict[
 
 def run_session(plan: Dict[str, Any] | SessionPlan, config_path: str = "config.yaml") -> Dict[str, Any]:
     cfg = load_config_safe(config_path)
+    set_style_templates(cfg.get("_assets", {}).get("style_templates"))
     root_logger = logging.getLogger()
     if not root_logger.handlers:
         level_name = str(cfg.get("logging", {}).get("level", "INFO")).upper()

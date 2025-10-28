@@ -56,6 +56,10 @@ def run_selftest(cfg: dict, base_dir: Path) -> None:
     tracemalloc.start()
     start_time = time.perf_counter()
 
+    from sequencer import generate_pattern, set_style_templates
+
+    set_style_templates(cfg.get("_assets", {}).get("style_templates"))
+
     def run_check(name: str, func: Callable[[], str]) -> None:
         try:
             message = func()
@@ -244,6 +248,31 @@ def run_selftest(cfg: dict, base_dir: Path) -> None:
                 )
             ratios.append(f"{shape}={ratio:.3f}")
         return "ratios moyens " + ", ".join(ratios)
+
+    def _check_pattern_generator() -> str:
+        styles_cfg = cfg.get("styles", {})
+        styles = styles_cfg if isinstance(styles_cfg, dict) else {}
+        style_name = next(iter(styles.keys()), "techno_peak")
+        pattern_a = generate_pattern(str(style_name), 16, 1234)
+        pattern_b = generate_pattern(str(style_name), 16, 1234)
+        kick_a = pattern_a.get("kick", [])
+        if kick_a != pattern_b.get("kick", []):
+            raise RuntimeError("générateur non déterministe pour la piste kick")
+        if not kick_a:
+            raise RuntimeError("aucun pas généré pour la piste kick")
+        kick_hits = sum(1 for st in kick_a if getattr(st, "note", None) is not None)
+        if kick_hits <= 0:
+            raise RuntimeError("aucun déclenchement détecté pour la piste kick")
+        pad_notes = [
+            int(st.note)
+            for st in pattern_a.get("pad", [])
+            if getattr(st, "note", None) is not None
+        ]
+        if not pad_notes:
+            raise RuntimeError("aucune note générée pour la piste pad")
+        if not all(0 <= note <= 127 for note in pad_notes):
+            raise RuntimeError("note pad hors plage MIDI")
+        return f"kick hits={kick_hits}; pad notes uniques={len(set(pad_notes))}"
 
     def _check_analysis() -> str:
         import numpy as np
@@ -556,6 +585,7 @@ def run_selftest(cfg: dict, base_dir: Path) -> None:
 
     run_check("Budget fichiers", _check_file_budget)
     run_check("DSP de base", _check_dsp_core)
+    run_check("Générateur de motifs", _check_pattern_generator)
     run_check("Alignement delay", _check_delay_alignment)
     run_check("Sidechain", _check_sidechain)
     run_check("Analyses audio", _check_analysis)
