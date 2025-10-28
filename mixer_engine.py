@@ -286,7 +286,7 @@ class MixerEngine:
     ) -> np.ndarray:
         if signal.ndim > 1:
             signal = signal[:, 0]
-        signal = np.asarray(signal, dtype=np.float64, copy=False)
+        signal = np.asarray(signal, dtype=np.float64)
         padded = np.zeros(length, dtype=np.float64)
         copy_len = min(length, signal.size)
         if copy_len:
