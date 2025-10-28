@@ -256,9 +256,76 @@ def main() -> None:
             "[Σ] self-test sidechain — réduction moyenne conforme pour shapes lin/exp/log (±10%)."
         )
 
+        from analysis_tools import (
+            detect_clicks,
+            measure_correlation,
+            measure_lufs,
+            measure_true_peak,
+            mono_bass_check,
+        )
         from midi_writer import MIDIFile
         from midi_cc_db import CCResolver
         from sequencer import Sequencer, Pattern, Step
+
+        analysis_cfg = cfg.get("analysis", {})
+        style_lufs = analysis_cfg.get("tolerances", {}).get("lufs_i", {})
+        sr_analysis = int(cfg["audio"].get("sample_rate", 48000))
+        analysis_results: list[str] = []
+        if style_lufs:
+            noise_len = int(sr_analysis * 6.0)
+            base_noise = rng.standard_normal(noise_len).astype(np.float32) * 0.1
+            stereo_template = np.stack([base_noise, base_noise], axis=1)
+            for style_name, bounds in style_lufs.items():
+                style_cfg = cfg.get("styles", {}).get(style_name)
+                if not style_cfg or not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+                    continue
+                target_lufs = float(style_cfg.get("target_lufs", np.mean(bounds)))
+                measured_base = measure_lufs(stereo_template, sr_analysis)
+                scale = float(10.0 ** ((target_lufs - measured_base) / 20.0))
+                test_signal = np.clip(stereo_template * scale, -1.0, 1.0)
+                lufs = float(measure_lufs(test_signal, sr_analysis))
+                lo, hi = float(bounds[0]), float(bounds[1])
+                if not (lo <= lufs <= hi):
+                    raise RuntimeError(
+                        f"Échec self-test analyse: style {style_name} LUFS {lufs:.2f} (tol {lo:.2f}..{hi:.2f})."
+                    )
+                dbtp_limit = float(
+                    analysis_cfg.get("tolerances", {}).get(
+                        "dbtp_max", cfg.get("export", {}).get("target_peak_dbtp", 0.0)
+                    )
+                )
+                dbtp = float(measure_true_peak(test_signal, sr_analysis))
+                if dbtp > dbtp_limit + 0.2:
+                    raise RuntimeError(
+                        f"Échec self-test analyse: style {style_name} dBTP {dbtp:.2f} > {dbtp_limit:.2f} + tolérance."
+                    )
+                corr = float(measure_correlation(test_signal))
+                corr_min = analysis_cfg.get("tolerances", {}).get("correlation_min")
+                if corr_min is not None and corr < float(corr_min) - 1e-3:
+                    raise RuntimeError(
+                        f"Échec self-test analyse: style {style_name} corr {corr:.3f} < {float(corr_min):.3f}."
+                    )
+                bass = float(
+                    mono_bass_check(
+                        test_signal,
+                        sr_analysis,
+                        float(cfg["audio"].get("mono_bass_hz", 150.0)),
+                    )
+                )
+                if bass < 0.9:
+                    raise RuntimeError(
+                        f"Échec self-test analyse: style {style_name} mono bass {bass:.3f} < 0.900."
+                    )
+                clicks = int(detect_clicks(test_signal))
+                if clicks != 0:
+                    raise RuntimeError(
+                        f"Échec self-test analyse: style {style_name} {clicks} clic(s) détecté(s)."
+                    )
+                analysis_results.append(
+                    f"{style_name}: LUFS={lufs:.2f}, dBTP={dbtp:.2f}, corr={corr:.3f}, mono={bass:.3f}"
+                )
+        if analysis_results:
+            print("[Σ] self-test analyse métriques — " + "; ".join(analysis_results) + ".")
 
         def _assert_meta_presence(numerator: int, denominator: int) -> None:
             midi = MIDIFile()

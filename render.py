@@ -396,17 +396,85 @@ def _export_audio_and_midi(stereo: np.ndarray, trackbufs: Dict[str, np.ndarray],
 
     return {"master": master_path, "stems": stems, "midi": midi_path}, _cc_used, cc_origin_stats
 
-def _analyze(stereo: np.ndarray, cfg: Dict[str, Any]) -> Dict[str, float]:
+def _evaluate_analysis(metrics: Dict[str, float], cfg: Dict[str, Any], style: str) -> Dict[str, Any]:
+    analysis_cfg = cfg.get("analysis", {})
+    tolerances = analysis_cfg.get("tolerances", {})
+    evaluation: Dict[str, Any] = {}
+
+    lufs_target = tolerances.get("lufs_i", {}).get(style)
+    if lufs_target and metrics.get("lufs_i") is not None:
+        lo, hi = float(lufs_target[0]), float(lufs_target[1])
+        val = float(metrics["lufs_i"])
+        ok = lo <= val <= hi
+        evaluation["lufs_i"] = {"ok": ok, "range": [lo, hi], "value": val}
+        if not ok:
+            logger.warning("[Σ] Loudness hors tolérance pour %s: %.2f LUFS (cible %.2f..%.2f).", style, val, lo, hi)
+
+    dbtp_max = tolerances.get("dbtp_max")
+    if dbtp_max is not None and metrics.get("dBTP") is not None:
+        val = float(metrics["dBTP"])
+        limit = float(dbtp_max)
+        ok = val <= limit + 0.2
+        evaluation["dBTP"] = {"ok": ok, "max": limit, "value": val}
+        if not ok:
+            logger.warning("[Σ] Pic réel au-delà du plafond: %.2f dBTP (max %.2f).", val, limit)
+
+    corr_min = tolerances.get("correlation_min")
+    if corr_min is not None and metrics.get("corr") is not None:
+        val = float(metrics["corr"])
+        min_val = float(corr_min)
+        ok = val >= min_val
+        evaluation["corr"] = {"ok": ok, "min": min_val, "value": val}
+        if not ok:
+            logger.warning("[Σ] Corrélation stéréo basse: %.2f (min %.2f).", val, min_val)
+
+    mono_floor = tolerances.get("mono_bass_min", 0.85)
+    if metrics.get("mono_bass_check") is not None:
+        val = float(metrics["mono_bass_check"])
+        ok = val >= float(mono_floor)
+        evaluation["mono_bass_check"] = {"ok": ok, "min": float(mono_floor), "value": val}
+        if not ok:
+            logger.warning("[Σ] Compatibilité mono basse douteuse: %.2f (min %.2f).", val, mono_floor)
+
+    clicks_limit = tolerances.get("clicks_max", 0)
+    if metrics.get("clicks") is not None:
+        val = int(metrics["clicks"])
+        ok = val <= int(clicks_limit)
+        evaluation["clicks"] = {"ok": ok, "max": int(clicks_limit), "value": val}
+        if not ok:
+            logger.warning("[Σ] Détection de %d clic(s) (max autorisé %d).", val, clicks_limit)
+
+    return evaluation
+
+
+def _analyze(stereo: np.ndarray, cfg: Dict[str, Any], style: str) -> Tuple[Dict[str, float], Dict[str, Any]]:
     try:
-        from analysis_tools import measure_lufs, measure_true_peak, measure_correlation, mono_bass_check, detect_clicks
-        lufs = float(measure_lufs(stereo, int(cfg["audio"]["sample_rate"])))
-        dbtp = float(measure_true_peak(stereo, int(cfg["audio"]["sample_rate"])))
+        from analysis_tools import (
+            detect_clicks,
+            measure_correlation,
+            measure_lufs,
+            measure_true_peak,
+            mono_bass_check,
+        )
+
+        sr = int(cfg["audio"]["sample_rate"])
+        lufs = float(measure_lufs(stereo, sr))
+        dbtp = float(measure_true_peak(stereo, sr))
         corr = float(measure_correlation(stereo))
-        mbc  = float(mono_bass_check(stereo, int(cfg["audio"]["sample_rate"]), float(cfg["audio"].get("mono_bass_hz",150))))
-        clk  = int(detect_clicks(stereo))
-        return {"lufs_i": lufs, "dBTP": dbtp, "corr": corr, "mono_bass_check": mbc, "clicks": clk}
-    except Exception:
-        return {"lufs_i": -999.0, "dBTP": 0.0, "corr": 1.0}
+        mbc = float(mono_bass_check(stereo, sr, float(cfg["audio"].get("mono_bass_hz", 150.0))))
+        clk = int(detect_clicks(stereo))
+        metrics = {
+            "lufs_i": lufs,
+            "dBTP": dbtp,
+            "corr": corr,
+            "mono_bass_check": mbc,
+            "clicks": clk,
+        }
+        evaluation = _evaluate_analysis(metrics, cfg, style)
+        return metrics, evaluation
+    except Exception as exc:
+        logger.warning("[Σ] Analyse audio échouée: %s", exc)
+        return {"lufs_i": None, "dBTP": None, "corr": None}, {}
 
 def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") -> Dict[str, Any]:
     cfg = load_config_safe(config_path)
@@ -485,7 +553,10 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
                            sidechain_sources=sc_sources)
 
     outs, cc_used, cc_origin_stats = _export_audio_and_midi(stereo, tracks, cfg, plan, cfg["paths"]["output"])
-    metrics = _analyze(stereo, cfg) if cfg["analysis"]["run_after_export"] else {}
+    if cfg["analysis"].get("run_after_export", False):
+        metrics, analysis_eval = _analyze(stereo, cfg, plan.style)
+    else:
+        metrics, analysis_eval = {}, {}
 
     cc_origin_stats.setdefault("real", 0)
     cc_origin_stats.setdefault("HYPOTHÈSE", 0)
@@ -511,6 +582,7 @@ def run_session(session_plan: Dict[str, Any], config_path: str = "config.yaml") 
             "mono_bass_hz": int(cfg["audio"]["mono_bass_hz"])
         },
         "metrics": metrics,
+        "analysis_evaluation": analysis_eval,
         "sc_routes": [f"{r['src']}->{r['dst']}" for r in cfg["styles"][style].get("sidechain_routes", [])],
         "cc_used": cc_used,
         "cc_origin_stats": cc_origin_stats,
