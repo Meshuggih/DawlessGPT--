@@ -208,6 +208,53 @@ def main() -> None:
             f"[Σ] self-test delay tempo-sync — toutes les divisions alignées à ±{tol_samples} échantillons."
         )
 
+        sc_len = sr
+        pad_signal = np.ones(sc_len, dtype=np.float32)
+        control_signal = np.linspace(0.0, 1.0, sc_len, dtype=np.float32)
+        baseline_engine = MixerEngine(mixer_cfg)
+        baseline_engine.set_track_order(["pad"])
+        baseline_mix = baseline_engine.render_mix({"pad": pad_signal})
+        baseline_mean = float(np.mean(np.abs(baseline_mix[:, 0])) + 1e-12)
+
+        depth_db = 6.0
+        attack_ms = 5.0
+        release_ms = 80.0
+        tol_ratio = 0.10
+        for shape in ("lin", "exp", "log"):
+            sc_engine = MixerEngine(mixer_cfg)
+            sc_engine.set_track_order(["pad"])
+            sc_engine.create_sidechain(
+                ["control"],
+                "pad",
+                depth_db=depth_db,
+                attack_ms=attack_ms,
+                release_ms=release_ms,
+                shape=shape,
+            )
+            mixed = sc_engine.render_mix({"pad": pad_signal, "control": control_signal})
+            mixed_mean = float(np.mean(np.abs(mixed[:, 0])) + 1e-12)
+            ratio = mixed_mean / baseline_mean
+
+            expected_gain = sc_engine._sidechain_gain_from_signal(
+                control_signal,
+                length=sc_len,
+                depth_db=depth_db,
+                attack_ms=attack_ms,
+                release_ms=release_ms,
+                shape=shape,
+            )
+            expected_ratio = float(np.mean(expected_gain))
+            if expected_ratio <= 0.0:
+                raise RuntimeError("Échec du test sidechain: gain moyen attendu nul.")
+            if abs(ratio - expected_ratio) > tol_ratio * expected_ratio:
+                raise RuntimeError(
+                    "Échec du test sidechain: "
+                    f"shape={shape} ratio={ratio:.3f} attendu={expected_ratio:.3f} (tol ±{tol_ratio*100:.1f} %)."
+                )
+        print(
+            "[Σ] self-test sidechain — réduction moyenne conforme pour shapes lin/exp/log (±10%)."
+        )
+
         print("[Σ] self-test ok — budget fichiers respecté et configuration chargée.")
         return
 

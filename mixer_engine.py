@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 from dsp_core import brickwall_limit
-from fx_processors import Compressor, Delay, SchroederReverb
+from fx_processors import Delay, SchroederReverb
 
 
 @dataclass
@@ -23,14 +23,20 @@ class TrackSettings:
 
 @dataclass
 class SidechainRoute:
-    """Describe a sidechain relation from ``src`` to ``dst``."""
+    """Describe a sidechain relation from one or many ``sources`` to ``dst``."""
 
-    src: str
+    sources: List[str]
     dst: str
     depth_db: float
     attack_ms: float
     release_ms: float
     shape: str = "exp"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sources, list):
+            self.sources = list(self.sources)
+        self.sources = [str(src) for src in self.sources]
+        self.shape = str(self.shape).lower()
 
 
 class MixerEngine:
@@ -169,6 +175,39 @@ class MixerEngine:
     def clear_sidechains(self) -> None:
         self._sidechain_routes.clear()
 
+    def create_sidechain(
+        self,
+        src_names: Sequence[str] | str,
+        dst_name: str,
+        *,
+        depth_db: float = 3.0,
+        attack_ms: float = 5.0,
+        release_ms: float = 80.0,
+        shape: str = "exp",
+    ) -> None:
+        """Register a sidechain route supporting multiple sources."""
+
+        if isinstance(src_names, (str, bytes)):
+            sources = [str(src_names)]
+        else:
+            sources = [str(src) for src in src_names]
+        if not sources:
+            raise ValueError("sidechain sources list must not be empty")
+
+        shape_lc = str(shape).lower()
+        if shape_lc not in {"lin", "exp", "log"}:
+            raise ValueError(f"invalid sidechain shape '{shape}' (expected lin/exp/log)")
+
+        route = SidechainRoute(
+            sources=sources,
+            dst=str(dst_name),
+            depth_db=float(depth_db),
+            attack_ms=float(attack_ms),
+            release_ms=float(release_ms),
+            shape=shape_lc,
+        )
+        self._sidechain_routes.append(route)
+
     def create_sc(
         self,
         src_name: str,
@@ -178,17 +217,16 @@ class MixerEngine:
         release_ms: float = 80.0,
         shape: str = "exp",
     ) -> None:
-        """Register a sidechain compression route."""
+        """Backward-compatible wrapper for legacy renderers."""
 
-        route = SidechainRoute(
-            src=str(src_name),
-            dst=str(dst_name),
+        self.create_sidechain(
+            src_name,
+            dst_name,
             depth_db=float(depth_db),
             attack_ms=float(attack_ms),
             release_ms=float(release_ms),
             shape=str(shape),
         )
-        self._sidechain_routes.append(route)
 
     # --------------------------------------------------------------- rendering --
     @staticmethod
@@ -210,6 +248,68 @@ class MixerEngine:
         if buf is None:
             return None
         return np.asarray(buf)
+
+    def _sidechain_envelope(
+        self,
+        signal: np.ndarray,
+        *,
+        attack_ms: float,
+        release_ms: float,
+    ) -> np.ndarray:
+        rectified = np.abs(signal.astype(np.float64, copy=False))
+        if not rectified.size:
+            return rectified
+
+        eps_time = 1e-9
+        attack_s = max(float(attack_ms) / 1000.0, eps_time)
+        release_s = max(float(release_ms) / 1000.0, eps_time)
+        attack_coeff = np.exp(-1.0 / (attack_s * self.sample_rate))
+        release_coeff = np.exp(-1.0 / (release_s * self.sample_rate))
+
+        env = np.zeros_like(rectified)
+        acc = 0.0
+        for i, sample in enumerate(rectified):
+            coeff = attack_coeff if sample > acc else release_coeff
+            acc = (1.0 - coeff) * sample + coeff * acc
+            env[i] = acc
+        return env
+
+    def _sidechain_gain_from_signal(
+        self,
+        signal: np.ndarray,
+        *,
+        length: int,
+        depth_db: float,
+        attack_ms: float,
+        release_ms: float,
+        shape: str,
+    ) -> np.ndarray:
+        if signal.ndim > 1:
+            signal = signal[:, 0]
+        signal = np.asarray(signal, dtype=np.float64, copy=False)
+        padded = np.zeros(length, dtype=np.float64)
+        copy_len = min(length, signal.size)
+        if copy_len:
+            padded[:copy_len] = signal[:copy_len]
+
+        env = self._sidechain_envelope(padded, attack_ms=attack_ms, release_ms=release_ms)
+        eps = 1e-12
+        peak = float(np.max(env))
+        if peak <= eps:
+            return np.ones(length, dtype=np.float64)
+        env_norm = env / (peak + eps)
+
+        shape = shape.lower()
+        if shape == "exp":
+            shaped = env_norm ** 2
+        elif shape == "log":
+            shaped = np.sqrt(env_norm)
+        else:
+            shaped = env_norm
+
+        min_gain = 10.0 ** (-float(depth_db) / 20.0)
+        gain = 1.0 - shaped * (1.0 - min_gain)
+        return np.clip(gain, min_gain, 1.0)
 
     def render_mix(
         self,
@@ -253,42 +353,55 @@ class MixerEngine:
             left_gain = np.cos(angle)
             right_gain = np.sin(angle)
 
+            track_len = buf.shape[0] if buf.ndim > 1 else buf.size
+            routes = sc_by_dst.get(name, [])
+            gain_curve: Optional[np.ndarray] = None
+            if routes:
+                total_gain = np.ones(track_len, dtype=np.float64)
+                applied = False
+                for route in routes:
+                    route_gain = np.ones(track_len, dtype=np.float64)
+                    for src_name in route.sources:
+                        sc_signal = None
+                        if src_name in track_buffers:
+                            sc_signal = track_buffers[src_name]
+                        if src_name in extra_sources:
+                            sc_signal = extra_sources[src_name]
+                        if (
+                            sc_signal is None
+                            and sidechain_kick is not None
+                            and src_name.lower() == "kick"
+                        ):
+                            sc_signal = sidechain_kick
+                        if sc_signal is None:
+                            continue
+                        gain = self._sidechain_gain_from_signal(
+                            sc_signal,
+                            length=track_len,
+                            depth_db=route.depth_db,
+                            attack_ms=route.attack_ms,
+                            release_ms=route.release_ms,
+                            shape=route.shape,
+                        )
+                        route_gain *= gain
+                        applied = True
+                    total_gain *= route_gain
+                if applied:
+                    gain_curve = total_gain
+
             if buf.ndim == 2 and buf.shape[1] >= 2:
-                left_sig = np.asarray(buf[:, 0], dtype=np.float64) * volume
-                right_sig = np.asarray(buf[:, 1], dtype=np.float64) * volume
+                left_sig = np.asarray(buf[:, 0], dtype=np.float64)
+                right_sig = np.asarray(buf[:, 1], dtype=np.float64)
+                if gain_curve is not None:
+                    left_sig = left_sig * gain_curve[: left_sig.size]
+                    right_sig = right_sig * gain_curve[: right_sig.size]
+                left_sig *= volume
+                right_sig *= volume
                 send_signal = 0.5 * (left_sig + right_sig)
             else:
                 mono = np.asarray(buf, dtype=np.float64)
-
-                for route in sc_by_dst.get(name, []):
-                    sc_signal = None
-                    if route.src in track_buffers:
-                        sc_signal = track_buffers[route.src]
-                    if route.src in extra_sources:
-                        sc_signal = extra_sources[route.src]
-                    if sc_signal is None and sidechain_kick is not None and route.src.lower() == "kick":
-                        sc_signal = sidechain_kick
-                    if sc_signal is None:
-                        continue
-                    comp = Compressor(
-                        self.sample_rate,
-                        threshold_db=-24.0,
-                        ratio=1.0 + max(1.0, route.depth_db / 1.5),
-                        attack_ms=route.attack_ms,
-                        release_ms=route.release_ms,
-                    )
-                    sc_arr = np.asarray(sc_signal, dtype=np.float32)
-                    if sc_arr.ndim > 1:
-                        sc_arr = sc_arr[:, 0]
-                    mono32 = mono.astype(np.float32, copy=False)
-                    ducked = comp.process(mono32, sc_arr[: mono32.size])
-                    gain = ducked.astype(np.float64) / (mono + 1e-12)
-                    if route.shape == "exp":
-                        gain = gain ** 2
-                    elif route.shape == "log":
-                        gain = np.sqrt(np.maximum(gain, 0.0))
-                    mono = mono * gain
-
+                if gain_curve is not None:
+                    mono = mono * gain_curve[: mono.size]
                 mono *= volume
 
                 left_sig = mono * left_gain
