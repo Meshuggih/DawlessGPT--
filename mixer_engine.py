@@ -297,19 +297,19 @@ class MixerEngine:
         peak = float(np.max(env))
         if peak <= eps:
             return np.ones(length, dtype=np.float64)
-        env_norm = env / (peak + eps)
+        env_norm = np.clip(env / (peak + eps), 0.0, 1.0)
 
-        shape = shape.lower()
-        if shape == "exp":
-            shaped = env_norm ** 2
-        elif shape == "log":
+        shape_lc = shape.lower()
+        if shape_lc == "exp":
+            shaped = env_norm ** 2.0
+        elif shape_lc == "log":
             shaped = np.sqrt(env_norm)
         else:
             shaped = env_norm
 
-        min_gain = 10.0 ** (-float(depth_db) / 20.0)
-        gain = 1.0 - shaped * (1.0 - min_gain)
-        return np.clip(gain, min_gain, 1.0)
+        target_gain = 10.0 ** (-float(depth_db) / 20.0)
+        gain = 1.0 - (1.0 - target_gain) * shaped
+        return np.clip(gain, target_gain, 1.0)
 
     def render_mix(
         self,
