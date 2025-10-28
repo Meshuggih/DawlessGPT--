@@ -93,11 +93,7 @@ class MIDIFile:
 
         if numerator <= 0 or denominator <= 0:
             raise ValueError("Time signature must use positive integers")
-        # MIDI expects denominators as power-of-two exponents. Clamp to sensible
-        # values to keep malformed configs in check.
-        power = int(round(math.log(denominator, 2))) if denominator > 0 else 2
-        power = max(0, min(power, 7))
-        self._time_sig = (int(numerator), int(2 ** power))
+        self._time_sig = (int(numerator), int(denominator))
 
     # ------------------------------------------------------------------
     # Track / event management
@@ -163,7 +159,10 @@ class MIDIFile:
 
     def _meta_time_signature(self, numerator: int, denominator: int) -> bytes:
         denom = max(1, int(denominator))
-        dd = int(round(math.log(denom, 2))) if denom > 0 else 0
+        try:
+            dd = int(round(math.log2(denom)))
+        except AttributeError:  # pragma: no cover - Python <3.3 fallback
+            dd = int(round(math.log(denom, 2)))
         dd = max(0, min(dd, 7))
         cc = 24  # MIDI clocks per metronome click
         bb = 8   # 32nd notes per MIDI quarter
