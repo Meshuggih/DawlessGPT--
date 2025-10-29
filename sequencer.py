@@ -212,7 +212,8 @@ class Sequencer:
         self.patterns[track_name] = pattern
 
     def to_midi(self, midi, cc_resolver, bpm: float, collect_cc: Optional[list] = None):
-        dt_beats = (self.humanize.get("time_ms", 0.0) / 1000.0) * (bpm / 60.0)
+        jitter_range_beats = abs(self.humanize.get("time_ms", 0.0)) / 1000.0
+        jitter_range_beats *= bpm / 60.0
         vel_var = int(self.humanize.get("vel_var", 0) or 0)
 
         def _register_cc(
@@ -256,7 +257,12 @@ class Sequencer:
                 assert st.note is not None
                 base_dur = max(0.05, float(st.length_beats))
                 dv = random.randint(-vel_var, vel_var) if vel_var > 0 else 0
-                start = float(st.beat) + dt_beats
+                jitter = (
+                    random.uniform(-jitter_range_beats, jitter_range_beats)
+                    if jitter_range_beats > 0.0
+                    else 0.0
+                )
+                start = float(st.beat) + jitter
                 velocity = int(max(1, min(127, st.vel + dv)))
 
                 # Determine overlap for slides.
@@ -269,7 +275,7 @@ class Sequencer:
                             next_st = steps[j]
                             break
                     if next_st is not None:
-                        next_start = float(next_st.beat) + dt_beats
+                        next_start = float(next_st.beat)
                         duration = max(duration, (next_start - start) + slide_overlap)
                 midi.add_note(
                     ti,

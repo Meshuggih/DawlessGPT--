@@ -6,8 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-from dsp_core import brickwall_limit
-from fx_processors import Delay, SchroederReverb
+from fx_processors import Delay, SchroederReverb, TruePeakLimiter
 
 
 @dataclass
@@ -69,6 +68,8 @@ class MixerEngine:
         self.cfg_fx_reverb_room_size = float(fx_defaults.get("reverb_room_size", 0.8))
         self.cfg_fx_reverb_pre_delay = fx_defaults.get("reverb_pre_delay", "1/64")
 
+        self.master_pregain: float = 1.0
+
         self.reverb_bus = SchroederReverb(
             self.sample_rate,
             tempo_bpm=self.tempo_bpm,
@@ -84,6 +85,7 @@ class MixerEngine:
             mix=self.cfg_fx_delay_mix,
             time=self.cfg_fx_delay_time,
         )
+        self._tp_limiter = TruePeakLimiter(self._limiter_ceiling_db)
 
         self.track_order: List[str] = []
         self.tracks: Dict[str, TrackSettings] = {}
@@ -307,7 +309,11 @@ class MixerEngine:
         else:
             shaped = env_norm
 
-        target_gain = 10.0 ** (-float(depth_db) / 20.0)
+        depth = float(depth_db)
+        if depth <= 0.0:
+            return np.ones(length, dtype=np.float64)
+        ratio = 1.0 + max(1.0, depth / 1.5)
+        target_gain = 1.0 / ratio
         gain = 1.0 - (1.0 - target_gain) * shaped
         return np.clip(gain, target_gain, 1.0)
 
@@ -362,11 +368,9 @@ class MixerEngine:
                 for route in routes:
                     route_gain = np.ones(track_len, dtype=np.float64)
                     for src_name in route.sources:
-                        sc_signal = None
-                        if src_name in track_buffers:
+                        sc_signal = extra_sources.get(src_name)
+                        if sc_signal is None and src_name in track_buffers:
                             sc_signal = track_buffers[src_name]
-                        if src_name in extra_sources:
-                            sc_signal = extra_sources[src_name]
                         if (
                             sc_signal is None
                             and sidechain_kick is not None
@@ -395,8 +399,8 @@ class MixerEngine:
                 if gain_curve is not None:
                     left_sig = left_sig * gain_curve[: left_sig.size]
                     right_sig = right_sig * gain_curve[: right_sig.size]
-                left_sig *= volume
-                right_sig *= volume
+                left_sig *= volume * left_gain
+                right_sig *= volume * right_gain
                 send_signal = 0.5 * (left_sig + right_sig)
             else:
                 mono = np.asarray(buf, dtype=np.float64)
@@ -441,10 +445,9 @@ class MixerEngine:
             master[:, 0] = low_m + (master[:, 0] - low_l)
             master[:, 1] = low_m + (master[:, 1] - low_r)
 
-        headroom_gain = 10.0 ** (-self.headroom_db / 20.0)
-        master *= headroom_gain
+        master *= float(self.master_pregain)
 
-        stereo32 = master.astype(np.float32)
-        left_limited = brickwall_limit(stereo32[:, 0], self._limiter_ceiling_db)
-        right_limited = brickwall_limit(stereo32[:, 1], self._limiter_ceiling_db)
-        return np.stack([left_limited, right_limited], axis=1)
+        limited = self._tp_limiter.process(master.astype(np.float32))
+        if limited.ndim == 1:
+            limited = limited[:, None]
+        return np.asarray(limited, dtype=np.float32)

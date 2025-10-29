@@ -14,6 +14,11 @@ Les exports (WAV 24-bit / 48 kHz, MIDI et rapport Σ JSON) sont regroupés dans 
 ## QA intégré (offline)
 ```bash
 python /mnt/data/cli.py --selftest --style techno_peak --bpm 130 --seed 4242 --dur 8
+
+# Suites de tests offline (stdlib + numpy uniquement)
+python tests/test_delay_alignment.py
+python tests/test_render_sigma_smoke.py
+python tests/test_analyze_suite_sigma.py
 ```
 
 - Delay tempo-sync : subdivisions 1/8, 1/8., 1/8T, 1/16, 3/16 (1er écho ±2 échantillons).
