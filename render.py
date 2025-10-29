@@ -14,6 +14,7 @@ import re
 from datetime import datetime, timezone
 
 from mixer_engine import MixerEngine
+from fx_processors import Delay
 from dsp_core import brickwall_limit
 from arrangement_engine import ArrangementEngine
 from modulation_matrix import ModulationMatrix, DropBusSource
@@ -565,11 +566,12 @@ def _render_tracks(plan: SessionPlan, cfg: Dict[str, Any]) -> Dict[str, np.ndarr
 
 def _float_to_int24_pcm(x: np.ndarray, dither: bool=False) -> bytes:
     x = np.clip(x, -1.0, 1.0)
-    if x.ndim == 1: x = x[:, None]
+    if x.ndim == 1:
+        x = x[:, None]
     if dither:
-        lsb = 1.0/8388607.0
-        rng = np.random.RandomState(12345)
-        d = (rng.rand(*x.shape) - rng.rand(*x.shape)) * lsb
+        lsb = 1.0 / 8388607.0
+        rng = np.random.default_rng()
+        d = (rng.random(x.shape) - rng.random(x.shape)) * lsb
         x = np.clip(x + d, -1.0, 1.0)
     s = (x * 8388607.0).astype(np.int32)
     out = bytearray()
@@ -633,9 +635,12 @@ def _export_audio_and_midi(
             stems[name] = p
 
     midifile = MIDIFile()
-    midifile.set_tempo(plan.bpm)
-    ts = (cfg["audio"].get("time_signature", "4/4") or "4/4").split("/")
-    midifile.set_time_signature(int(ts[0]), int(ts[1]))
+    midifile.set_tempo(float(plan.bpm))
+    n, d = map(
+        int,
+        (cfg["audio"].get("time_signature", "4/4") or "4/4").split("/"),
+    )
+    midifile.set_time_signature(n, d)
 
     assets = cfg.get("_assets", {})
     resolver = CCResolver(
@@ -867,6 +872,9 @@ def run_session(plan: Dict[str, Any] | SessionPlan, config_path: str = "config.y
 
     tracks = _render_tracks(session_plan, cfg)
     mx = MixerEngine(cfg)
+    mx.master_pregain = 10.0 ** (
+        -float(cfg["export"].get("headroom_db", 1.0)) / 20.0
+    )
     names = list(tracks.keys())
     mx.set_track_order(names)
     for name in names:
@@ -886,32 +894,69 @@ def run_session(plan: Dict[str, Any] | SessionPlan, config_path: str = "config.y
         arranger.apply_modulations(modmat, drop_destinations)
         arranger.apply_final_values_to_mixer(mx, drop_destinations)
     drop_summary = arranger.summarise_modulations(drop_destinations) if drop_destinations else []
+    sc_routes_summary = [
+        {
+            "sources": list(route.sources),
+            "dst": route.dst,
+            "depth_db": float(route.depth_db),
+            "attack_ms": float(route.attack_ms),
+            "release_ms": float(route.release_ms),
+            "shape": route.shape,
+        }
+        for route in getattr(mx, "_sidechain_routes", [])
+    ]
 
     fxov = cfg["styles"][session_plan.style].get("fx_overrides", {})
-    reverb_overrides: Dict[str, Any] = {}
-    if "reverb_mix" in fxov:
-        reverb_overrides["mix"] = float(fxov["reverb_mix"])
-    if "reverb_decay" in fxov:
-        reverb_overrides["decay"] = float(fxov["reverb_decay"])
-    if "reverb_room_size" in fxov:
-        reverb_overrides["room_size"] = float(fxov["reverb_room_size"])
-    if "reverb_pre_delay" in fxov:
-        reverb_overrides["pre_delay"] = fxov["reverb_pre_delay"]
-    if reverb_overrides:
+    if fxov:
+        mix_val = fxov.get("reverb_mix")
+        decay_factor = fxov.get("reverb_decay")
+        room_factor = fxov.get("reverb_room_size")
+        pre_delay_override = fxov.get("reverb_pre_delay")
+
+        mix_value = (
+            float(np.clip(mix_val, 0.0, 1.0))
+            if mix_val is not None
+            else mx.cfg_fx_reverb_mix
+        )
+        decay_value = mx.cfg_fx_reverb_decay
+        if decay_factor is not None:
+            decay_value = float(
+                np.clip(mx.cfg_fx_reverb_decay * float(decay_factor), 0.05, 12.0)
+            )
+        room_value = mx.cfg_fx_reverb_room_size
+        if room_factor is not None:
+            room_value = float(
+                np.clip(mx.cfg_fx_reverb_room_size * float(room_factor), 0.1, 3.0)
+            )
+        pre_delay_value = (
+            pre_delay_override if pre_delay_override is not None else mx.cfg_fx_reverb_pre_delay
+        )
         mx.configure_reverb(
-            mix=reverb_overrides.get("mix", mx.cfg_fx_reverb_mix),
-            decay=reverb_overrides.get("decay", mx.cfg_fx_reverb_decay),
-            room_size=reverb_overrides.get("room_size", mx.cfg_fx_reverb_room_size),
-            pre_delay=reverb_overrides.get("pre_delay", mx.cfg_fx_reverb_pre_delay),
+            mix=mix_value,
+            decay=decay_value,
+            room_size=room_value,
+            pre_delay=pre_delay_value,
             tempo_bpm=session_plan.bpm,
         )
-    if "delay_time" in fxov:
-        mx.configure_delay(
-            time=fxov["delay_time"],
-            feedback=mx.cfg_fx_delay_feedback,
-            mix=mx.cfg_fx_delay_mix,
-            tempo_bpm=session_plan.bpm,
-        )
+
+        if "delay_time" in fxov or "delay_mix" in fxov or "delay_feedback" in fxov:
+            delay_time = fxov.get("delay_time", mx.cfg_fx_delay_time)
+            delay_mix = fxov.get("delay_mix", mx.cfg_fx_delay_mix)
+            delay_feedback = fxov.get("delay_feedback", mx.cfg_fx_delay_feedback)
+            mx.configure_delay(
+                time=delay_time,
+                feedback=float(delay_feedback),
+                mix=float(delay_mix),
+                tempo_bpm=session_plan.bpm,
+            )
+
+    mx.delay_bus = Delay(
+        mx.sample_rate,
+        tempo_bpm=session_plan.bpm,
+        feedback=mx.cfg_fx_delay_feedback,
+        mix=mx.cfg_fx_delay_mix,
+        time=mx.cfg_fx_delay_time,
+    )
 
     sc_sources: Dict[str, np.ndarray] = {}
     for r in cfg["styles"][session_plan.style].get("sidechain_routes", []):
@@ -1006,9 +1051,7 @@ def run_session(plan: Dict[str, Any] | SessionPlan, config_path: str = "config.y
         },
         "metrics": metrics,
         "analysis_evaluation": analysis_eval,
-        "sc_routes": [
-            f"{r['src']}->{r['dst']}" for r in cfg["styles"][session_plan.style].get("sidechain_routes", [])
-        ],
+        "sc_routes": sc_routes_summary,
         "cc_used": cc_used,
         "cc_origin_stats": cc_origin_stats,
         "device_map": cfg.get("midi_cc", {}).get("device_map", {}),
