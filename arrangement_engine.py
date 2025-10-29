@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import yaml
+import ast
+import json
 
 
 @dataclass
@@ -137,7 +138,7 @@ class ArrangementEngine:
         else:
             try:
                 with open(self.protocols_path, "r", encoding="utf-8") as fh:
-                    self.protocols = yaml.safe_load(fh) or {}
+                    self.protocols = _load_yaml_like(fh.read()) or {}
             except FileNotFoundError:
                 self.protocols = {}
         if not isinstance(self.protocols, dict):
@@ -260,3 +261,136 @@ class ArrangementEngine:
 
 
 __all__ = ["ArrangementEngine", "DestinationSlot"]
+def _parse_scalar(value: str) -> Any:
+    token = value.strip()
+    if not token or token.lower() in {"null", "~"}:
+        return None
+    lowered = token.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if (token.startswith('"') and token.endswith('"')) or (
+        token.startswith("'") and token.endswith("'")
+    ):
+        return token[1:-1]
+    try:
+        if any(ch in token for ch in (".", "e", "E")):
+            return float(token)
+        return int(token)
+    except ValueError:
+        return token
+
+
+def _parse_inline_dict(text: str) -> Dict[str, Any]:
+    inner = text.strip()[1:-1].strip()
+    if not inner:
+        return {}
+    parts: List[str] = []
+    depth = 0
+    current: List[str] = []
+    for ch in inner:
+        if ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+
+    out: Dict[str, Any] = {}
+    for part in parts:
+        if not part:
+            continue
+        key, _, raw_val = part.partition(":")
+        key = key.strip().strip('"\'')
+        out[key] = _parse_value(raw_val.strip())
+    return out
+
+
+def _parse_value(token: str) -> Any:
+    if not token:
+        return None
+    stripped = token.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        return _parse_inline_dict(stripped)
+    if stripped.startswith("[") and stripped.endswith("]"):
+        try:
+            return ast.literal_eval(stripped)
+        except Exception:
+            return stripped
+    return _parse_scalar(stripped)
+
+
+def _load_yaml_like(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped:
+        return {}
+    try:
+        return json.loads(stripped)
+    except Exception:
+        pass
+
+    lines: List[Tuple[int, str]] = []
+    for raw in text.splitlines():
+        trimmed = raw.split("#", 1)[0].rstrip()
+        if not trimmed.strip():
+            continue
+        indent = len(trimmed) - len(trimmed.lstrip(" "))
+        content = trimmed.strip()
+        lines.append((indent, content))
+
+    if not lines:
+        return {}
+
+    root: Any = {}
+    stack: List[Tuple[int, Any]] = [(-1, root)]
+
+    for idx, (indent, content) in enumerate(lines):
+        while len(stack) > 1 and indent < stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        next_line = lines[idx + 1] if idx + 1 < len(lines) else None
+
+        if content.startswith("- "):
+            if not isinstance(parent, list):
+                raise ValueError("unexpected list item outside list context")
+            value_part = content[2:].strip()
+            if not value_part:
+                container: Any
+                if next_line and next_line[0] > indent and next_line[1].startswith("- "):
+                    container = []
+                else:
+                    container = {}
+                parent.append(container)
+                stack.append((indent + 2, container))
+            else:
+                parent.append(_parse_value(value_part))
+            continue
+
+        key, _, raw_val = content.partition(":")
+        if not _:
+            raise ValueError(f"ligne YAML invalide: {content}")
+        key = key.strip().strip('"\'')
+        value_part = raw_val.strip()
+        if not value_part:
+            container = [] if (next_line and next_line[0] > indent and next_line[1].startswith("- ")) else {}
+            if isinstance(parent, list):
+                parent.append({key: container})
+                stack.append((indent + 2, container))
+            else:
+                parent[key] = container
+                stack.append((indent + 2, container))
+        else:
+            value = _parse_value(value_part)
+            if isinstance(parent, list):
+                parent.append({key: value})
+            else:
+                parent[key] = value
+
+    return root
+

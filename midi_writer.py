@@ -93,11 +93,7 @@ class MIDIFile:
 
         if numerator <= 0 or denominator <= 0:
             raise ValueError("Time signature must use positive integers")
-        # MIDI expects denominators as power-of-two exponents. Clamp to sensible
-        # values to keep malformed configs in check.
-        power = int(round(math.log(denominator, 2))) if denominator > 0 else 2
-        power = max(0, min(power, 7))
-        self._time_sig = (int(numerator), int(2 ** power))
+        self._time_sig = (int(numerator), int(denominator))
 
     # ------------------------------------------------------------------
     # Track / event management
@@ -161,13 +157,21 @@ class MIDIFile:
         mpqn = max(1, min(mpqn, 0xFFFFFF))
         return b"\xFF\x51\x03" + struct.pack(">I", mpqn)[1:]
 
-    def _meta_timesig(self) -> bytes:
-        nn, dd_val = self._time_sig
-        dd = int(round(math.log(dd_val, 2))) if dd_val > 0 else 2
+    def _meta_time_signature(self, numerator: int, denominator: int) -> bytes:
+        denom = max(1, int(denominator))
+        try:
+            dd = int(round(math.log2(denom)))
+        except AttributeError:  # pragma: no cover - Python <3.3 fallback
+            dd = int(round(math.log(denom, 2)))
         dd = max(0, min(dd, 7))
         cc = 24  # MIDI clocks per metronome click
         bb = 8   # 32nd notes per MIDI quarter
-        return b"\xFF\x58\x04" + bytes([nn & 0xFF, dd & 0xFF, cc & 0xFF, bb & 0xFF])
+        return b"\xFF\x58\x04" + bytes([
+            int(numerator) & 0xFF,
+            dd & 0xFF,
+            cc & 0xFF,
+            bb & 0xFF,
+        ])
 
     @staticmethod
     def _meta_end() -> bytes:
@@ -223,7 +227,8 @@ class MIDIFile:
 
     def _tempo_track(self) -> bytes:
         events = bytearray()
-        events += _var_len(0) + self._meta_timesig()
+        nn, dd = self._time_sig
+        events += _var_len(0) + self._meta_time_signature(nn, dd)
         events += _var_len(0) + self._meta_tempo()
         events += _var_len(0) + self._meta_end()
         return b"MTrk" + struct.pack(">I", len(events)) + bytes(events)
